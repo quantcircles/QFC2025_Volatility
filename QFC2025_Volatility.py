@@ -29,6 +29,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def integrate_trapezoid(y, x):
+    """Compatibility helper for NumPy versions where trapz may be unavailable."""
+    if hasattr(np, "trapezoid"):
+        return np.trapezoid(y, x)
+    return np.trapz(y, x)
+
+
+def extract_close_series(data, ticker):
+    """Handle both single-level and MultiIndex yfinance outputs."""
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+
+    if isinstance(data.columns, pd.MultiIndex):
+        adj_key = ('Adj Close', ticker)
+        close_key = ('Close', ticker)
+        if adj_key in data.columns:
+            series = data[adj_key]
+        elif close_key in data.columns:
+            series = data[close_key]
+        else:
+            close_like = [col for col in data.columns if col[0] in ('Adj Close', 'Close')]
+            if not close_like:
+                return pd.Series(dtype=float)
+            series = data[close_like[0]]
+    else:
+        if 'Adj Close' in data.columns:
+            series = data['Adj Close']
+        elif 'Close' in data.columns:
+            series = data['Close']
+        else:
+            return pd.Series(dtype=float)
+
+    return pd.to_numeric(series, errors='coerce').dropna()
+
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Nifty Maturity Hub", layout="wide")
 CACHE_DIR = "data_cache"
@@ -155,8 +190,8 @@ def get_svi_results(params, fwd_price, tte, strike_range):
     
     # Normalize PDF (Area = 1)
     pdf = np.maximum(pdf, 0)
-    pdf /= np.trapz(pdf, strikes)
-    area = np.trapz(pdf, strikes)
+    pdf /= integrate_trapezoid(pdf, strikes)
+    area = integrate_trapezoid(pdf, strikes)
     logger.info(f"PDF Integration Area (pre-norm): {area:.6f}")
     if area < 0.9:
         logger.error("Probability Density area is dangerously low. Check SVI fit.")
@@ -208,42 +243,36 @@ def get_india_vix(target_date,d=365):
     ticker = "^INDIAVIX"
     # Fetch a small window to ensure we get a valid trading day price
     start_dt = pd.to_datetime(target_date) - timedelta(days=d)
-    data = yf.download(ticker, start=start_dt, end=target_date + timedelta(days=1))
-    
-    if data.empty:
-        return np.nan
-    
-    # Extract the last available close price as a float
-    # vix_value = data['Close'].iloc[-1]
-    return data['Close']
+    data = yf.download(ticker, start=start_dt, end=target_date + timedelta(days=1), progress=False)
+    vix_series = extract_close_series(data, ticker)
+    return vix_series.rename('^INDIAVIX').to_frame()
 
 
 def get_realized_vol(ticker_symbol, target_date,h=30,d=365):
     # 1. Fetch historical data (Lookback ~45 days to get 30 trading days)
     start_dt = pd.to_datetime(target_date) - timedelta(days=d)
-    data = yf.download(ticker_symbol, start=start_dt, end=target_date + timedelta(days=1))
+    data = yf.download(ticker_symbol, start=start_dt, end=target_date + timedelta(days=1), progress=False)
     
     if data.empty:
-        return None, None
+        return pd.Series(dtype=float), None
     
     # Use 'Adj Close' for accuracy (dividends/splits), fallback to 'Close'
-    prices = data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
+    prices = extract_close_series(data, ticker_symbol)
+    if prices.empty:
+        return pd.Series(dtype=float), None
     
     # 2. Calculate Log Returns
     # Formula: ln(Price_t / Price_{t-1})
     log_returns = np.log(prices / prices.shift(1)).dropna()
     
-    # Take the last 30 trading days
-    recent_returns = log_returns.tail(h)
-    
     # 3. Calculate Daily Std Dev and Annualize
     # Annualization Factor = sqrt(252 trading days)
-    daily_vol = log_returns.rolling(h).apply(lambda x: x.std())
+    daily_vol = log_returns.rolling(h).std()
     annualized_rv = daily_vol * np.sqrt(252) * 100  # Convert to %
     
-    current_price = prices.iloc[-1]
+    current_price = float(prices.iloc[-1])
     
-    return annualized_rv, current_price
+    return annualized_rv.rename(ticker_symbol), current_price
 
 # Example Usage:
 # rv, price = get_realized_vol("^NSEI", "2026-01-05")
@@ -304,9 +333,9 @@ if st.session_state.active_df is not None:
     df_symbol = df[df['SYMBOL'] == symbol].copy()
     
     with tab3:
-        rv, _ = get_realized_vol('^NSEI',trading_date)
+        rv, _ = get_realized_vol('^NSEI', trading_date)
         vix = get_india_vix(trading_date)
-        vix['^NSEI']=rv['^NSEI']
+        vrp_df = vix.join(rv.rename('^NSEI'), how='inner').dropna()
         st.subheader('NIFTY - Volatility Risk Premium (VIX vs 30D Realized Volatility)')
         col1, col2= st.columns(2)
         
@@ -314,39 +343,43 @@ if st.session_state.active_df is not None:
             # Plot 1: Close Prices
             # Pass both columns as a list to y
             with st.container(border=True):
-                # st.plotly_chart(fig_price, use_container_width=True)
-                fig_vol = px.line(
-                    vix, 
-                    x=vix.index, 
-                    y=["^INDIAVIX", "^NSEI"], 
-                    title="Implied (VIX) vs Realized Volatility",
-                    labels={"value": "Volatility (%)", "variable": "Type"},
-                    template="plotly_dark"
-                )
-                
-                # Customize the lines for professional look
-                fig_vol.update_traces(line=dict(width=2))
-                fig_vol.update_layout(xaxis_title=None, hovermode="x unified")
-                
-                st.plotly_chart(fig_vol, use_container_width=True)
+                if vrp_df.empty:
+                    st.warning("Not enough VIX/price history to compute VRP for this date.")
+                else:
+                    fig_vol = px.line(
+                        vrp_df,
+                        x=vrp_df.index,
+                        y=["^INDIAVIX", "^NSEI"],
+                        title="Implied (VIX) vs Realized Volatility",
+                        labels={"value": "Volatility (%)", "variable": "Type"},
+                        template="plotly_dark"
+                    )
+
+                    # Customize the lines for professional look
+                    fig_vol.update_traces(line=dict(width=2))
+                    fig_vol.update_layout(xaxis_title=None, hovermode="x unified")
+
+                    st.plotly_chart(fig_vol, use_container_width=True)
         with col2:
              # Plot 1: Close Prices
              # Pass both columns as a list to y
              with st.container(border=True):
-                 fig_vol = px.line(
-                     vix, 
-                     x=vix.index, 
-                     y=vix["^INDIAVIX"]-vix["^NSEI"], 
-                     title="Volatility Risk Premium",
-                     labels={"value": "Volatility (%)", "variable": "Type"},
-                     template="plotly_dark"
-                 )
-                 
-                 # Customize the lines for professional look
-                 fig_vol.update_traces(line=dict(width=2))
-                 fig_vol.update_layout(xaxis_title=None, hovermode="x unified", yaxis_title="Volatility (%)")
-                 # fig_vol.update_yaxes(title_text="Volatility (%)")
-                 st.plotly_chart(fig_vol, use_container_width=True)
+                 if vrp_df.empty:
+                     st.warning("VRP series is unavailable for the selected window.")
+                 else:
+                     fig_vol = px.line(
+                         vrp_df,
+                         x=vrp_df.index,
+                         y=vrp_df["^INDIAVIX"] - vrp_df["^NSEI"],
+                         title="Volatility Risk Premium",
+                         labels={"value": "Volatility (%)", "variable": "Type"},
+                         template="plotly_dark"
+                     )
+
+                     # Customize the lines for professional look
+                     fig_vol.update_traces(line=dict(width=2))
+                     fig_vol.update_layout(xaxis_title=None, hovermode="x unified", yaxis_title="Volatility (%)")
+                     st.plotly_chart(fig_vol, use_container_width=True)
     with tab2:
         all_strikes = sorted(df_symbol['STRIKE'].unique())
         col_select, col_empty = st.columns([2, 4])
@@ -417,6 +450,9 @@ if st.session_state.active_df is not None:
     
         # Calculate IV for each row
         with st.spinner("Calculating Implied Volatility..."):
+            if final_df.empty:
+                st.warning("No contracts found for the selected expiry.")
+                st.stop()
             
             tte = get_tte(str(trading_date), selected_expiry)
             strike_range = 0.2
@@ -430,6 +466,9 @@ if st.session_state.active_df is not None:
                 (final_df['STRIKE'] <= upper_bound)
             ].copy()
             final_df = final_df[final_df['OI'] > min_volume]
+            if final_df.empty:
+                st.warning("No contracts left after strike/OI filters. Reduce minimum volume or widen range.")
+                st.stop()
             # 1. Identify the ATM Strike
             
             atm_strike = final_df.iloc[(final_df['STRIKE'] - spot_price).abs().argsort()[:1]]['STRIKE'].values[0]
@@ -462,11 +501,18 @@ if st.session_state.active_df is not None:
             smile_df['intrinsic'] = smile_df['intrinsic'].clip(lower=0)
             smile_df = smile_df[smile_df['CLOSE'] > smile_df['intrinsic']].copy()
             smile_df = smile_df[smile_df['CLOSE'] > 1.0]
+            if smile_df.empty:
+                st.warning("No OTM options left after intrinsic/price filters.")
+                st.stop()
             smile_df['IV'] = smile_df.apply(
                 lambda row: find_iv(row['CLOSE'], synthetic_fwd, row['STRIKE'], tte, row['TYPE']), axis=1
             )
             # Convert to percentage
             smile_df['IV_pct'] = smile_df['IV'] * 100
+            smile_df = smile_df.dropna(subset=['IV_pct'])
+            if smile_df.empty:
+                st.warning("IV calculation returned no valid points for SVI fit.")
+                st.stop()
             
             
             # --- RUNNING IT ---
@@ -492,8 +538,8 @@ if st.session_state.active_df is not None:
     #    st.plotly_chart(fig, width=True)
     # --- 3. SIDE-BY-SIDE VISUALIZATION ---
         
-            rv, _ = get_realized_vol(yf_symbol,trading_date,30)
-            rv = rv.iloc[-1][yf_symbol]
+            rv_series, _ = get_realized_vol(yf_symbol, trading_date, 30)
+            rv = rv_series.dropna().iloc[-1] if not rv_series.empty else np.nan
             # final_df['rv'] = rv
             logger.info(f"realized volatility: {rv}")
         st.subheader(f"📊 {symbol} Analysis - Expiry: {selected_expiry}")
@@ -543,13 +589,14 @@ if st.session_state.active_df is not None:
             for trace in fig_svi_line.data: #, fig_rv_line.data
                 fig_iv.add_trace(trace)
             
-            fig_iv.add_hline(
-            y=rv, 
-            line_dash="dash", 
-            line_color="#ff4b4b", 
-            annotation_text=f"30D Realized Vol ({rv:.2f}%)", 
-            annotation_position="bottom right"
-        )
+            if pd.notna(rv):
+                fig_iv.add_hline(
+                    y=rv,
+                    line_dash="dash",
+                    line_color="#ff4b4b",
+                    annotation_text=f"30D Realized Vol ({rv:.2f}%)",
+                    annotation_position="bottom right"
+                )
             
             # 5. Final updates and display
             fig_iv.update_layout(hovermode="x unified")
