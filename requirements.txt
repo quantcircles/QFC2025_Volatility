@@ -11,3 +11,5 @@ jugaad-data
 numpy<2.0.0
 scipy
 sympy
+polars
+mcp
