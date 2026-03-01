@@ -158,50 +158,66 @@ def _optimize_params(vol_df: pd.DataFrame, price_series: pd.Series, cost_bps: fl
     return best
 
 
-def _get_nse_symbols_by_oi(target_date: date, max_symbols: int = 40) -> List[str]:
+def _get_nse_symbols_by_oi(target_date: date, max_symbols: int = 40, max_fallback_days: int = 14) -> Tuple[List[str], date]:
     _ensure_dirs()
-    date_str = target_date.strftime("%Y%m%d")
-    cache_path = os.path.join(CACHE_DIR, f"fo_{date_str}.csv")
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.nseindia.com/",
+    }
+    session = requests.Session()
+    session.get("https://www.nseindia.com", headers=headers, timeout=5)
 
-    if os.path.exists(cache_path):
-        df = pd.read_csv(cache_path)
-    else:
+    df = None
+    effective_date = target_date
+    for offset in range(max_fallback_days + 1):
+        candidate_date = target_date - timedelta(days=offset)
+        date_str = candidate_date.strftime("%Y%m%d")
+        cache_path = os.path.join(CACHE_DIR, f"fo_{date_str}.csv")
+
+        if os.path.exists(cache_path):
+            df = pd.read_csv(cache_path)
+            effective_date = candidate_date
+            break
+
         url = f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{date_str}_F_0000.csv.zip"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.nseindia.com/",
-        }
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=5)
-        resp = session.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        import zipfile
+        try:
+            resp = session.get(url, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                continue
+            import zipfile
 
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            name = zf.namelist()[0]
-            with zf.open(name) as f:
-                df = pd.read_csv(f)
-        df.columns = [c.strip() for c in df.columns]
-        cols = {
-            "TckrSymb": "SYMBOL",
-            "OptnTp": "TYPE",
-            "OpnIntrst": "OI",
-        }
-        df = df.rename(columns=cols)
-        df.to_csv(cache_path, index=False)
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                name = zf.namelist()[0]
+                with zf.open(name) as f:
+                    df = pd.read_csv(f)
+            df.columns = [c.strip() for c in df.columns]
+            cols = {
+                "TckrSymb": "SYMBOL",
+                "OptnTp": "TYPE",
+                "OpnIntrst": "OI",
+            }
+            df = df.rename(columns=cols)
+            df.to_csv(cache_path, index=False)
+            effective_date = candidate_date
+            break
+        except Exception:
+            continue
+
+    if df is None:
+        return [], target_date
 
     if "SYMBOL" not in df.columns:
-        return []
+        return [], effective_date
     if "OI" not in df.columns:
-        return sorted(df["SYMBOL"].dropna().astype(str).unique().tolist())[:max_symbols]
+        return sorted(df["SYMBOL"].dropna().astype(str).unique().tolist())[:max_symbols], effective_date
 
     df["OI"] = pd.to_numeric(df["OI"], errors="coerce").fillna(0.0)
     oi_by_symbol = df.groupby("SYMBOL", as_index=False)["OI"].sum().sort_values("OI", ascending=False)
-    return oi_by_symbol["SYMBOL"].astype(str).head(max_symbols).tolist()
+    return oi_by_symbol["SYMBOL"].astype(str).head(max_symbols).tolist(), effective_date
 
 
 def _generate_daily_summary(trading_date: date, max_symbols: int = 40, top_n: int = 10, cost_bps: float = 2.0) -> str:
-    symbols = _get_nse_symbols_by_oi(trading_date, max_symbols=max_symbols)
+    symbols, effective_date = _get_nse_symbols_by_oi(trading_date, max_symbols=max_symbols)
     if not symbols:
         return f"# Daily Summary ({trading_date})\n\nNo symbols available."
 
@@ -254,6 +270,9 @@ def _generate_daily_summary(trading_date: date, max_symbols: int = 40, top_n: in
 
     lines = []
     lines.append(f"# Daily Volatility Strategy Summary ({trading_date})")
+    if effective_date != trading_date:
+        lines.append("")
+        lines.append(f"_No bhavcopy for {trading_date}; fallback used: {effective_date}_")
     lines.append("")
     lines.append(f"- Universe scanned: {len(symbols)} symbols (OI-filtered)")
     lines.append(f"- Valid optimized symbols: {len(rank_df)}")
