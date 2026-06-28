@@ -10,6 +10,14 @@ The current workflow pulls NIFTY 50 stock data from official NSE archive sources
 - NIFTY 50 constituents from the NSE index constituent CSV.
 - Daily cash-market bhavcopy files from NSE archive zip files.
 - Cleaned OHLCV-style rows for selected NIFTY 50 `EQ` symbols.
+- NSE Financial Results corporate filing records.
+- NSE financial-result announcement records used as a freshness cross-check.
+- NSE Shareholding Pattern corporate filing records.
+- Daily NIFTY fundamental score records.
+- Daily NIFTY technical score records using conventional value/mean-reversion
+  and momentum indicators computed from cached OHLCV price history.
+- Daily strategy backtests and rebalance holdings for Fundamental, Technical,
+  Average Score, and Mean Variance strategies.
 
 The output is suitable for downstream portfolio analysis, volatility research, and
 backtesting pipelines.
@@ -25,6 +33,13 @@ backtesting pipelines.
   - Pulls NIFTY 50 constituents.
   - Downloads and caches daily cash-market bhavcopy files.
   - Filters bhavcopy rows to NIFTY 50 equity symbols.
+  - Downloads NSE Financial Results and Shareholding Pattern records.
+  - Downloads financial-result announcements to detect newer filings when the
+    formal financial-results endpoint lags.
+  - Builds daily fundamental scores and carries forward unchanged scores.
+  - Builds historical daily technical scores from cached price files.
+  - Builds strategy backtest CSVs and rebalance holdings from cached score
+    histories.
   - Writes aggregate CSV outputs or one CSV per trading day.
 
 ## Dependencies
@@ -95,18 +110,88 @@ Increase the holiday/weekend lookback window if needed:
 python3 portfolioAnalysis_SM.py --previous-close --fallback-days 20
 ```
 
+Download only NSE fundamentals for the current NIFTY 50 list:
+
+```bash
+python3 portfolioAnalysis_SM.py --fundamentals-only
+```
+
+The Financial Results pull downloads both `Quarterly` and `Annual` filings. By
+default it looks back 8 years:
+
+```bash
+python3 portfolioAnalysis_SM.py --fundamentals-only --fundamentals-years 10
+```
+
+Download previous-close price files and fundamentals in one run:
+
+```bash
+python3 portfolioAnalysis_SM.py --previous-close --fundamentals
+```
+
+Generate daily fundamental scores after downloading fundamentals:
+
+```bash
+python3 portfolioAnalysis_SM.py --fundamentals-only --fundamental-scores
+```
+
+Download fundamentals and generate only the score file:
+
+```bash
+python3 portfolioAnalysis_SM.py --scores-only
+```
+
+Generate historical fundamental scores from cached fundamentals and cached
+business-day price files:
+
+```bash
+python3 portfolioAnalysis_SM.py --score-history-only
+```
+
+Generate historical technical scores from cached daily price files:
+
+```bash
+python3 portfolioAnalysis_SM.py --technical-score-history-only
+```
+
+Generate strategy backtests from cached fundamental and technical score history:
+
+```bash
+python3 portfolioAnalysis_SM.py --backtests
+```
+
+Daily end-to-end run, including latest price/fundamental refresh, score refresh,
+strategy backtests, holdings, and standalone dashboard HTML:
+
+```bash
+python3 portfolioAnalysis_SM.py --previous-close --fallback-days 14 --fundamentals --fundamental-scores --technical-scores --backtests --dashboard-html
+```
+
+Generate only the latest and datestamped dashboard HTML from cached histories and
+backtests:
+
+```bash
+python3 portfolioAnalysis_SM.py --dashboard-html
+```
+
 ## GitHub Actions Automation
 
 The daily GitHub Actions workflow in `.github/workflows/daily-summary.yml` runs on
 Indian market weekdays after the regular NSE close. As part of that run, it calls:
 
 ```bash
-python portfolioAnalysis_SM.py --previous-close --fallback-days 14
+python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --fundamentals --fundamental-scores --technical-scores --backtests --dashboard-html
 ```
 
 This writes the latest available previous-close NIFTY 50 files into
-`data_cache/nse_equity/`. The workflow then commits both generated report files
-and NSE data files back to the repository when anything changed.
+`data_cache/nse_equity/`, and writes NSE Financial Results and Shareholding Pattern
+CSVs into `data_cache/nse_equity/fundamentals/`. It also writes financial-result
+announcement CSVs, a daily fundamental score CSV, and technical score CSVs
+computed from the full cached price history. It then generates the strategy
+backtest and holdings CSVs under `data_cache/nse_equity/backtests/`. The workflow
+also writes `fundamental_score_dashboard.html` and a datestamped dashboard under
+`dashboards/`. It then commits generated report files, NSE data files, and
+dashboard files back to the repository when anything changed.
 
 ## Outputs
 
@@ -135,6 +220,70 @@ When `--daily-files` is used, generated files also include:
 - `constituents_by_day/nifty50_constituents_YYYYMMDD.csv`
   - One constituent file per available trading day.
 
+When `--fundamentals` or `--fundamentals-only` is used, generated files include:
+
+- `fundamentals/financial_results_by_day/nse_financial_results_YYYYMMDD.csv`
+  - NSE Financial Results records for the selected NIFTY 50 symbols.
+
+- `fundamentals/financial_result_announcements_by_day/nse_financial_result_announcements_YYYYMMDD.csv`
+  - NSE announcements that mention actual financial results filings.
+
+- `fundamentals/shareholding_by_day/nse_shareholding_pattern_YYYYMMDD.csv`
+  - NSE Shareholding Pattern records for the selected NIFTY 50 symbols.
+
+- `fundamentals/fundamental_scores_by_day/nse_fundamental_scores_YYYYMMDD.csv`
+  - One fundamental score row per selected NIFTY 50 symbol.
+
+- `fundamentals/fundamental_scores_history/nse_fundamental_scores_history_STARTDATE_ENDDATE.csv`
+  - Combined historical fundamental score file across cached business days.
+
+When `--technical-score-history` or `--technical-score-history-only` is used,
+generated files include:
+
+- `technicals/technical_scores_by_day/nse_technical_scores_YYYYMMDD.csv`
+  - One technical score row per selected symbol for each cached business day.
+
+- `technicals/technical_scores_history/nse_technical_scores_history_STARTDATE_ENDDATE.csv`
+  - Combined historical technical score file across cached business days.
+
+When `--backtests` is used, generated files include:
+
+- `backtests/fundamental_top10_score_weighted_backtest.csv`
+  - Daily return, cumulative return, portfolio value, and benchmark columns for
+    the Fundamental Score strategy.
+
+- `backtests/technical_top10_score_weighted_backtest.csv`
+  - Same fields for the Technical Score strategy.
+
+- `backtests/average_top10_score_weighted_backtest.csv`
+  - Same fields for the Average Score strategy, where strategy score is
+    `(fundamental_score + technical_score) / 2`.
+
+- `backtests/mvo_top10_score_weighted_backtest.csv`
+  - Same fields for the Mean Variance strategy.
+
+- `backtests/*_top10_score_weighted_holdings.csv`
+  - Rebalance holdings for each strategy, including score, weight, integer
+    previous quantity, integer target quantity, integer quantity change, entry
+    close, end close, and holding-period return.
+
+- `backtests/*_score_weighted_symbol_metrics.csv`
+  - Per-symbol return/risk/Sharpe/drawdown metrics used to rank strategy
+    candidates.
+
+- `backtests/selected_top10_score_weighted_symbol_metrics.csv`
+  - Combined top-10 symbol metrics across all strategies.
+
+When `--dashboard-html` is used, generated files include:
+
+- `fundamental_score_dashboard.html`
+  - Latest standalone dashboard HTML with embedded score history and strategy
+    backtest data.
+
+- `dashboards/fundamental_score_dashboard_YYYYMMDD.html`
+  - Datestamped standalone dashboard HTML, where `YYYYMMDD` is the latest score
+    history date embedded in the dashboard.
+
 ## Price Output Columns
 
 The cleaned price file contains the available columns from the NSE cash-market
@@ -157,6 +306,158 @@ bhavcopy, normalized to readable names:
 - `turnover`
 - `trades`
 
+## Fundamentals Output
+
+The Financial Results CSV stores the raw fields returned by NSE's corporate
+filings endpoint, plus:
+
+- `symbol`
+- `pulled_on`
+- `from_date`
+- `to_date`
+- `pulled_at`
+
+The Shareholding Pattern CSV follows the same convention. NSE fields can vary
+over time as exchange filing formats change, so the downloader preserves all
+available columns instead of forcing a narrow schema.
+
+## Fundamental Score Output
+
+The daily score file contains:
+
+- `fundamental_score`
+- `computed_score`
+- `previous_score`
+- `score_changed`
+- `score_source`
+- component scores for filing recency, disclosure, consistency, shareholding
+  recency, and promoter/public ownership fields.
+
+If a computed score is unchanged from the previous available score file, the
+daily row carries forward the prior `fundamental_score` and marks
+`score_changed` as `False`. If the computed score changes, the new score is used
+and `score_changed` is `True`.
+
+The first-pass score is based on NSE filing metadata, not fully parsed XBRL line
+items. It currently weights:
+
+- Quarterly filing recency, using financial-result announcements when they are
+  newer than the formal Financial Results endpoint.
+- Annual filing recency, using financial-result announcements when they are
+  newer than the formal Financial Results endpoint.
+- XBRL/new-format disclosure availability.
+- Filing history consistency.
+- Shareholding-pattern recency.
+- Latest promoter/public ownership fields.
+
+## Technical Score Output
+
+The daily technical score file is designed to be independently reproducible from
+the CSV itself. It includes the final score, component scores, raw indicators,
+cross-sectional ranks, and weights used in the formula.
+
+Top-level score columns:
+
+- `technical_score`
+- `value_score_0_50`
+- `momentum_score_0_50`
+
+Raw price and indicator columns include:
+
+- OHLCV fields: `open`, `high`, `low`, `close`, `previous_close`, `volume`,
+  `turnover`, `trades`
+- Momentum returns: `return_21d_pct`, `return_63d_pct`, `return_126d_pct`,
+  `return_252d_pct`
+- Trend indicators: `sma_20`, `sma_50`, `sma_200`, `sma50_over_sma200_pct`,
+  `close_vs_sma20_pct`
+- Liquidity/participation: `volume_sma_20`, `volume_vs_sma20_pct`
+- Value/mean-reversion indicators: `rolling_high_252`, `rolling_low_252`,
+  `discount_to_252d_high_pct`, `premium_to_252d_low_pct`,
+  `discount_to_sma200_pct`, `bollinger_pct_b`, `rsi_14`
+
+The value half of the score contributes 0 to 50 points:
+
+```text
+value_score_0_50 =
+  (0.40 * value_discount_high_rank
+ + 0.25 * value_discount_sma200_rank
+ + 0.20 * value_rsi_rank
+ + 0.15 * value_bollinger_rank) / 2
+```
+
+The momentum half contributes 0 to 50 points:
+
+```text
+momentum_score_0_50 =
+  (0.35 * momentum_21d_rank
+ + 0.35 * momentum_63d_rank
+ + 0.20 * momentum_126d_rank
+ + 0.10 * momentum_trend_rank) / 2
+```
+
+The final score is:
+
+```text
+technical_score = value_score_0_50 + momentum_score_0_50
+```
+
+Rank columns are daily cross-sectional percentile ranks across the available
+symbols for that business day. Higher ranks are better. Missing indicator ranks
+are filled with a neutral value of 50 during score calculation; the raw missing
+indicator values remain blank in the CSV.
+
+## Strategy Backtests
+
+`--backtests` reads the latest cached fundamental score history and technical
+score history. It does not require NSE network access when those history files
+already exist.
+
+Generated strategies:
+
+- `fundamental`
+  - Selects the 10 symbols with the highest realized score-weighted Sharpe from
+    the available history.
+  - Daily exposure is based on `fundamental_score / 100`.
+
+- `technical`
+  - Selects the 10 symbols with the highest realized score-weighted Sharpe from
+    the available history.
+  - Daily exposure is based on `technical_score / 100`.
+
+- `average`
+  - Uses `(fundamental_score + technical_score) / 2` as the strategy score.
+  - Selects the 10 symbols with the highest realized score-weighted Sharpe from
+    the available history.
+
+- `mvo`
+  - Rebalances every 30 business days.
+  - Ranks symbols by trailing mean-variance attractiveness using trailing
+    Sharpe.
+  - Selects the top 10 at each rebalance and optimizes long-only weights across
+    those 10 names.
+  - Weight bounds are 2% minimum and 20% maximum per selected symbol.
+  - Uses the Average Score top 10 as the first-block fallback when there is not
+    enough trailing return history.
+
+All strategy backtests start with `100000` initial capital and apply `0.01%`
+transaction cost on exposure or weight turnover. Benchmark columns are an
+equal-weight NIFTY constituent proxy built from cached constituent closes because
+the local cache does not include an official NIFTY index series.
+
+## HTML Dashboard
+
+`fundamental_score_dashboard.html` is a standalone browser dashboard generated
+from the cached price, fundamental score, and technical score history files. It
+embeds the required data directly and lets you choose:
+
+- NIFTY symbol
+- Fundamental variable
+- Technical indicator
+
+The chart shows close price, fundamental score, technical score, the selected
+fundamental variable, and the selected technical indicator on a normalized
+0-100 comparison axis. Hovering the chart shows raw values for each series.
+
 ## Current Behavior
 
 - Missing bhavcopy archive files, such as weekends or NSE holidays, are skipped.
@@ -169,8 +470,20 @@ bhavcopy, normalized to readable names:
   `--to` is not supplied.
 - Daily constituent files currently use the NSE archive constituent CSV available
   at run time. The workflow does not reconstruct historical index membership.
-- The NSE live JSON API is not used for this workflow because archive files are
-  more stable for repeatable research pulls.
+- Fundamentals files use NSE corporate filing APIs for Financial Results and
+  Shareholding Pattern. They are filing records, not normalized accounting ratios.
+- Financial-result announcements are used as a freshness overlay because the
+  formal NSE Financial Results endpoint can lag for some symbols.
+- Fundamental score files are generated daily. Unchanged scores are carried
+  forward from the latest prior score file.
+- Technical score history is generated from cached daily price files. It does
+  not require NSE network access when `prices_by_day/` already exists.
+- Technical-score rows follow the symbols available in each cached daily price
+  file; a symbol absent from a source price file is absent from that day's
+  technical score file.
+- Price files use NSE archive CSVs. Fundamentals files use NSE corporate filing
+  JSON endpoints because those records are not available in the same archive
+  format.
 
 ## Verification
 
@@ -192,12 +505,53 @@ Daily-file smoke test:
 python3 portfolioAnalysis_SM.py --from 2026-06-22 --to 2026-06-26 --symbols RELIANCE TCS --daily-files
 ```
 
+Fundamentals smoke test:
+
+```bash
+python3 portfolioAnalysis_SM.py --fundamentals-only --symbols RELIANCE --limit 1
+```
+
+Fundamental score smoke test:
+
+```bash
+python3 portfolioAnalysis_SM.py --scores-only --symbols RELIANCE --limit 1
+```
+
+Technical score history smoke test:
+
+```bash
+python3 portfolioAnalysis_SM.py --technical-score-history-only --symbols RELIANCE TCS
+```
+
+Backtest generation smoke test from cached score histories:
+
+```bash
+python3 portfolioAnalysis_SM.py --backtests
+```
+
+Dashboard HTML smoke test from cached histories and backtests:
+
+```bash
+python3 portfolioAnalysis_SM.py --dashboard-html
+```
+
 Expected result:
 
 - A constituent CSV with 50 rows.
 - A price CSV with rows for available trading dates in the requested range.
 - With `--daily-files`, one price CSV and one constituent CSV for each available
   trading day.
+- With `--fundamentals-only`, one Financial Results CSV and one Shareholding
+  Pattern CSV, plus one financial-result announcements CSV.
+- With `--scores-only`, one Financial Results CSV, one Shareholding Pattern CSV,
+  one financial-result announcements CSV, and one Fundamental Score CSV.
+- With `--technical-score-history-only`, one technical score CSV per cached
+  business day and one combined technical score history CSV.
+- With `--backtests`, four strategy backtest CSVs, four strategy holdings CSVs,
+  four per-strategy symbol metrics CSVs, and one combined selected top-10 metrics
+  CSV under `data_cache/nse_equity/backtests/`.
+- With `--dashboard-html`, the latest standalone HTML dashboard and one
+  datestamped copy under `dashboards/`.
 
 ## Documentation Maintenance
 
