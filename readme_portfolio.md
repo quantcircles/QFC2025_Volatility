@@ -193,6 +193,11 @@ also writes `fundamental_score_dashboard.html` and a datestamped dashboard under
 `dashboards/`. It then commits generated report files, NSE data files, and
 dashboard files back to the repository when anything changed.
 
+NSE can return `403 Forbidden` to GitHub-hosted runners for the live corporate
+filing endpoints. When that happens, the script falls back to the latest cached
+fundamentals under `data_cache/nse_equity/fundamentals/` so the daily price,
+score, backtest, and dashboard pipeline can still complete.
+
 ## Outputs
 
 By default, files are written under:

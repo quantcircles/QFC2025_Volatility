@@ -316,6 +316,13 @@ def selected_nifty_symbols(
     return pull_symbols
 
 
+def load_latest_cached_constituents(output_dir: Path) -> pd.DataFrame | None:
+    path = latest_csv_file(output_dir / "constituents_by_day", "nifty50_constituents_*.csv")
+    if path is None:
+        path = latest_csv_file(output_dir, "nifty50_constituents_*.csv")
+    return pd.read_csv(path) if path is not None else None
+
+
 def write_daily_outputs(
     prices: pd.DataFrame,
     constituents: pd.DataFrame,
@@ -2091,30 +2098,50 @@ def main() -> None:
             f"{fundamentals.shareholding_path}"
         )
     elif needs_fundamentals:
-        fundamentals = download_nse_fundamentals(
-            output_dir=args.output_dir,
-            symbols=args.symbols,
-            limit=args.limit,
-            lookback_years=max(args.fundamentals_years, 1),
-        )
-        print(
-            f"Financial results: {len(fundamentals.financial_results)} rows -> "
-            f"{fundamentals.financial_results_path}"
-        )
-        print(
-            f"Financial result announcements: {len(fundamentals.financial_announcements)} rows -> "
-            f"{fundamentals.financial_announcements_path}"
-        )
-        print(
-            f"Shareholding pattern: {len(fundamentals.shareholding)} rows -> "
-            f"{fundamentals.shareholding_path}"
-        )
+        try:
+            fundamentals = download_nse_fundamentals(
+                output_dir=args.output_dir,
+                symbols=args.symbols,
+                limit=args.limit,
+                lookback_years=max(args.fundamentals_years, 1),
+            )
+            print(
+                f"Financial results: {len(fundamentals.financial_results)} rows -> "
+                f"{fundamentals.financial_results_path}"
+            )
+            print(
+                f"Financial result announcements: {len(fundamentals.financial_announcements)} rows -> "
+                f"{fundamentals.financial_announcements_path}"
+            )
+            print(
+                f"Shareholding pattern: {len(fundamentals.shareholding)} rows -> "
+                f"{fundamentals.shareholding_path}"
+            )
+        except Exception as exc:
+            print(f"Live NSE fundamentals download failed: {exc}")
+            print("Falling back to latest cached fundamentals.")
+            fundamentals = load_latest_cached_fundamentals(args.output_dir)
+            print(
+                f"Cached financial results: {len(fundamentals.financial_results)} rows -> "
+                f"{fundamentals.financial_results_path}"
+            )
+            print(
+                f"Cached financial result announcements: {len(fundamentals.financial_announcements)} rows -> "
+                f"{fundamentals.financial_announcements_path}"
+            )
+            print(
+                f"Cached shareholding pattern: {len(fundamentals.shareholding)} rows -> "
+                f"{fundamentals.shareholding_path}"
+            )
 
     if args.fundamental_scores:
         if fundamentals is None:
             raise RuntimeError("Fundamentals are required before fundamental scores can be generated.")
+        constituents = load_latest_cached_constituents(args.output_dir)
+        if constituents is None:
+            constituents = get_nifty_constituents(NSEArchiveClient())
         score_symbols = selected_nifty_symbols(
-            get_nifty_constituents(NSEArchiveClient()),
+            constituents,
             symbols=args.symbols,
             limit=args.limit,
         )

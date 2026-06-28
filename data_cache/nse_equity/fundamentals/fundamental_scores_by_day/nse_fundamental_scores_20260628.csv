@@ -1,0 +1,2 @@
+score_date,symbol,fundamental_score,computed_score,previous_score,score_changed,score_source,quarterly_recency_score,annual_recency_score,disclosure_score,filing_consistency_score,shareholding_recency_score,promoter_score,latest_quarter_end,latest_annual_end,latest_result_announcement_dt,result_freshness_source,latest_shareholding_date,latest_promoter_holding,latest_public_holding,previous_score_file
+2026-06-28,RELIANCE,100,100,,True,computed,30,20,15,10,15,10,2026-03-31,2026-03-31,2026-04-24,financial_result_announcements,2026-03-31,50,50,
