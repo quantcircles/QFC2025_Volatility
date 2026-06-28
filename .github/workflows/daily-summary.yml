@@ -1,10 +1,13 @@
 name: Daily Summary Report
 
+# Run automatically on Indian market weekdays and allow manual runs from GitHub.
 on:
   schedule:
+    # 12:30 UTC = 18:00 IST, after the regular NSE cash-market close.
     - cron: "30 12 * * 1-5"
   workflow_dispatch:
 
+# Needed so the workflow can commit generated files back to the repository.
 permissions:
   contents: write
 
@@ -12,6 +15,7 @@ jobs:
   generate-report:
     runs-on: ubuntu-latest
     env:
+      # Keep Python date handling aligned with the Indian market calendar.
       TZ: Asia/Kolkata
     steps:
       - name: Checkout
@@ -27,18 +31,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Download NSE previous-close files
+        run: |
+          # Writes the latest available NIFTY 50 close and constituent snapshot.
+          python portfolioAnalysis_SM.py --previous-close --fallback-days 14
+
       - name: Generate daily summary
         run: |
+          # The agent writes dated reports under reports/ and updates the latest summary.
           python - <<'PY'
           from datetime import date
           from agents.daily_summary_mcp_agent import _generate_daily_summary
           print(_generate_daily_summary(date.today()))
           PY
 
-      - name: Commit and push reports
+      - name: Commit and push generated files
         run: |
+          # Commit only when report generation or NSE downloads changed files.
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add reports/
-          git diff --cached --quiet || git commit -m "chore: daily summary report"
+          git add data_cache/nse_equity/
+          git diff --cached --quiet || git commit -m "chore: daily summary and nse files"
           git push
