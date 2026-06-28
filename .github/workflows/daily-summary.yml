@@ -33,8 +33,11 @@ jobs:
 
       - name: Download NSE previous-close files
         run: |
-          # Writes the latest available NIFTY 50 close and constituent snapshot.
-          python portfolioAnalysis_SM.py --previous-close --fallback-days 14
+          # Writes the latest available NIFTY 50 close, constituent snapshot,
+          # financial results, shareholding pattern, fundamental score files,
+          # technical score files using the full cached price history, and
+          # daily strategy backtests with rebalance holdings and dashboard HTML.
+          python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --fundamentals --fundamental-scores --technical-scores --backtests --dashboard-html
 
       - name: Generate daily summary
         run: |
@@ -52,5 +55,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add reports/
           git add data_cache/nse_equity/
+          git add dashboards/
+          git add fundamental_score_dashboard.html
           git diff --cached --quiet || git commit -m "chore: daily summary and nse files"
           git push
