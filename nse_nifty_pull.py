@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import html
+from html.parser import HTMLParser
 import io
 import json
 import re
@@ -12,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote, urlparse
 import zipfile
 
 import numpy as np
@@ -23,6 +26,11 @@ from scipy.optimize import minimize
 NSE_HOME = "https://www.nseindia.com"
 NSE_ARCHIVES = "https://archives.nseindia.com"
 NSE_SEARCHIVES = "https://nsearchives.nseindia.com"
+BSE_HOME = "https://www.bseindia.com"
+BSE_API = "https://api.bseindia.com"
+MONEYCONTROL_HOME = "https://www.moneycontrol.com"
+ECONOMIC_TIMES_HOME = "https://economictimes.indiatimes.com"
+SCREENER_HOME = "https://www.screener.in"
 NIFTY_50_INDEX = "NIFTY 50"
 
 
@@ -64,6 +72,13 @@ class TechnicalScoreHistoryResult:
     history_path: Path
     score_paths: tuple[Path, ...]
     scores: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class IndexHistoryResult:
+    history_path: Path | None
+    index_paths: tuple[Path, ...]
+    index_history: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -138,6 +153,124 @@ class NSEArchiveClient:
         raise RuntimeError(f"NSE JSON request failed for {url}: {last_error}") from last_error
 
 
+class BSEArchiveClient:
+    """Small BSE client for corporate filing metadata endpoints."""
+
+    def __init__(self, timeout: int = 25, pause_seconds: float = 0.45) -> None:
+        self.timeout = timeout
+        self.pause_seconds = pause_seconds
+        self.session = requests.Session()
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": BSE_HOME,
+            "Referer": f"{BSE_HOME}/",
+        }
+
+    def get_json(self, path: str, params: dict[str, str]) -> list[dict] | dict:
+        url = path if path.startswith("http") else f"{BSE_API}{path}"
+        last_error: Exception | None = None
+
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, params=params, headers=self.headers, timeout=self.timeout)
+                response.raise_for_status()
+                return response.json()
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                time.sleep(self.pause_seconds * (attempt + 1))
+
+        raise RuntimeError(f"BSE JSON request failed for {url}: {last_error}") from last_error
+
+
+class SimpleTableParser(HTMLParser):
+    """Dependency-free HTML table extractor for provider fallback pages."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[list[str]]] = []
+        self._table_depth = 0
+        self._current_table: list[list[str]] = []
+        self._current_row: list[str] = []
+        self._cell_parts: list[str] = []
+        self._in_cell = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "table":
+            self._table_depth += 1
+            if self._table_depth == 1:
+                self._current_table = []
+        elif self._table_depth and tag == "tr":
+            self._current_row = []
+        elif self._table_depth and tag in {"td", "th"}:
+            self._in_cell = True
+            self._cell_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._table_depth and tag in {"td", "th"} and self._in_cell:
+            text = html.unescape(" ".join(" ".join(self._cell_parts).split()))
+            self._current_row.append(text)
+            self._in_cell = False
+            self._cell_parts = []
+        elif self._table_depth and tag == "tr":
+            if any(cell for cell in self._current_row):
+                self._current_table.append(self._current_row)
+            self._current_row = []
+        elif tag == "table" and self._table_depth:
+            if self._table_depth == 1 and self._current_table:
+                self.tables.append(self._current_table)
+            self._table_depth -= 1
+
+
+class WebFundamentalsClient:
+    """HTTP client for Moneycontrol and Economic Times fundamental pages."""
+
+    def __init__(self, timeout: int = 25, pause_seconds: float = 0.5) -> None:
+        self.timeout = timeout
+        self.pause_seconds = pause_seconds
+        self.session = requests.Session()
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/html,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    def get_text(self, url: str, referer: str | None = None) -> str:
+        headers = dict(self.headers)
+        if referer:
+            headers["Referer"] = referer
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, headers=headers, timeout=self.timeout)
+                response.raise_for_status()
+                return response.text
+            except requests.RequestException as exc:
+                last_error = exc
+                time.sleep(self.pause_seconds * (attempt + 1))
+        raise RuntimeError(f"Web fundamentals request failed for {url}: {last_error}") from last_error
+
+    def get_json(self, url: str, referer: str | None = None) -> list[dict] | dict:
+        text = self.get_text(url, referer=referer)
+        try:
+            return json.loads(text)
+        except ValueError as exc:
+            raise RuntimeError(f"JSON response was not returned for {url}") from exc
+
+
 def parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -171,6 +304,81 @@ def parse_result_period_end(text: str) -> pd.Timestamp:
     day = match.iloc[0, 1]
     year = match.iloc[0, 2]
     return pd.to_datetime(f"{month} {day} {year}", errors="coerce")
+
+
+def parse_filing_period_end(text: str) -> pd.Timestamp:
+    parsed = parse_result_period_end(text)
+    if pd.notna(parsed):
+        return parsed
+    if not isinstance(text, str) or not text.strip():
+        return pd.NaT
+
+    month_pattern = (
+        r"January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
+    )
+    patterns = [
+        rf"(\d{{1,2}})(?:st|nd|rd|th)?[\s\-/.]+({month_pattern})[\s,\-/.]+(\d{{4}})",
+        rf"({month_pattern})[\s,\-/.]+(\d{{1,2}})(?:st|nd|rd|th)?[\s,\-/.]+(\d{{4}})",
+        r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})",
+        r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        groups = match.groups()
+        if re.match(month_pattern, groups[0], flags=re.IGNORECASE):
+            candidate = f"{groups[0]} {groups[1]} {groups[2]}"
+            return pd.to_datetime(candidate, errors="coerce")
+        if len(groups[0]) == 4:
+            candidate = f"{groups[0]}-{groups[1]}-{groups[2]}"
+            return pd.to_datetime(candidate, errors="coerce")
+        candidate = f"{groups[0]} {groups[1]} {groups[2]}"
+        return pd.to_datetime(candidate, errors="coerce", dayfirst=True)
+    return pd.NaT
+
+
+def first_present(row: pd.Series, names: Iterable[str], default: str = "") -> str:
+    for name in names:
+        if name in row.index and pd.notna(row[name]):
+            value = str(row[name]).strip()
+            if value and value.lower() != "nan":
+                return value
+    return default
+
+
+def normalize_bse_payload(payload: list[dict] | dict) -> pd.DataFrame:
+    if isinstance(payload, list):
+        return pd.DataFrame(payload)
+    if not isinstance(payload, dict):
+        return pd.DataFrame()
+    for key in ("Table", "Table1", "data", "Data", "List", "Result"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return pd.DataFrame(value)
+    rows = [value for value in payload.values() if isinstance(value, list)]
+    return pd.DataFrame(rows[0]) if rows else pd.DataFrame()
+
+
+def bse_attachment_url(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if value.lower().startswith("http"):
+        return value
+    return f"{BSE_HOME}/xml-data/corpfiling/AttachLive/{value}"
+
+
+def bse_xbrl_url(value: str) -> str:
+    value = str(value or "").strip()
+    if not value or value.lower() == "nan":
+        return ""
+    if not re.search(r"xbrl|xml", value, flags=re.IGNORECASE):
+        return ""
+    if value.lower().startswith("http"):
+        return value
+    return f"{BSE_HOME}/xml-data/corpfiling/AttachLive/{value}"
 
 
 def iter_dates(start: date, end: date) -> Iterable[date]:
@@ -340,6 +548,116 @@ def write_daily_outputs(
     prices.to_csv(prices_path, index=False)
     constituents.to_csv(constituents_path, index=False)
     return constituents_path, prices_path
+
+
+def get_nifty_index_close(client: NSEArchiveClient, trade_date: date, cache_dir: Path) -> pd.DataFrame:
+    date_stamp = trade_date.strftime("%Y%m%d")
+    cache_path = cache_dir / f"ind_close_all_{date_stamp}.csv"
+    if cache_path.exists():
+        raw = pd.read_csv(cache_path)
+    else:
+        url = f"{NSE_ARCHIVES}/content/indices/ind_close_all_{trade_date.strftime('%d%m%Y')}.csv"
+        content = client.get_bytes(url, allow_missing=True)
+        if content is None:
+            return pd.DataFrame()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(content)
+        raw = pd.read_csv(io.BytesIO(content))
+
+    if raw.empty:
+        return pd.DataFrame()
+    raw.columns = [str(col).strip() for col in raw.columns]
+    name_col = next((col for col in raw.columns if col.lower().replace(" ", "") == "indexname"), None)
+    if name_col is None:
+        return pd.DataFrame()
+    nifty = raw[raw[name_col].astype(str).str.upper().str.strip().eq(NIFTY_50_INDEX)].copy()
+    if nifty.empty:
+        return pd.DataFrame()
+
+    def first_col(*names: str) -> pd.Series:
+        normalized = {col.lower().replace(" ", "").replace(".", "").replace("_", ""): col for col in nifty.columns}
+        for name in names:
+            key = name.lower().replace(" ", "").replace(".", "").replace("_", "")
+            if key in normalized:
+                return nifty[normalized[key]]
+        return pd.Series(np.nan, index=nifty.index)
+
+    out = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(first_col("Index Date"), errors="coerce", dayfirst=True).dt.date.astype(str),
+            "index_name": NIFTY_50_INDEX,
+            "open": pd.to_numeric(first_col("Open Index Value"), errors="coerce"),
+            "high": pd.to_numeric(first_col("High Index Value"), errors="coerce"),
+            "low": pd.to_numeric(first_col("Low Index Value"), errors="coerce"),
+            "close": pd.to_numeric(first_col("Closing Index Value"), errors="coerce"),
+            "points_change": pd.to_numeric(first_col("Points Change"), errors="coerce"),
+            "change_pct": pd.to_numeric(first_col("Change(%)", "Change %"), errors="coerce"),
+            "volume": pd.to_numeric(first_col("Volume"), errors="coerce"),
+            "turnover_rs_cr": pd.to_numeric(first_col("Turnover (Rs. Cr.)", "Turnover Rs Cr"), errors="coerce"),
+            "pe": pd.to_numeric(first_col("P/E", "PE"), errors="coerce"),
+            "pb": pd.to_numeric(first_col("P/B", "PB"), errors="coerce"),
+            "div_yield": pd.to_numeric(first_col("Div Yield", "Dividend Yield"), errors="coerce"),
+            "source": "nse_index_close_archive",
+        }
+    )
+    out.loc[out["trade_date"].eq("NaT") | out["trade_date"].eq("nan"), "trade_date"] = trade_date.isoformat()
+    return out.dropna(subset=["close"]).head(1)
+
+
+def pull_nifty_index_history(
+    start: date,
+    end: date,
+    output_dir: Path = Path("data_cache/nse_equity"),
+    daily_files: bool = True,
+    latest_available_only: bool = False,
+    fallback_days: int = 10,
+) -> IndexHistoryResult:
+    if end < start:
+        raise ValueError("end date must be on or after start date")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    index_cache_dir = output_dir / "index_cache"
+    index_by_day_dir = output_dir / "index_by_day"
+    index_history_dir = output_dir / "index_history"
+    index_cache_dir.mkdir(parents=True, exist_ok=True)
+    index_by_day_dir.mkdir(parents=True, exist_ok=True)
+    index_history_dir.mkdir(parents=True, exist_ok=True)
+
+    client = NSEArchiveClient()
+    candidate_dates = (
+        (end - timedelta(days=offset) for offset in range(fallback_days + 1))
+        if latest_available_only
+        else iter_dates(start, end)
+    )
+    frames = []
+    index_paths: list[Path] = []
+    for trade_date in candidate_dates:
+        if trade_date < start:
+            break
+        try:
+            row = get_nifty_index_close(client, trade_date, index_cache_dir)
+        except RuntimeError as exc:
+            print(f"NIFTY index archive fetch failed for {trade_date}: {exc}")
+            row = pd.DataFrame()
+        if not row.empty:
+            frames.append(row)
+            if daily_files:
+                path = index_by_day_dir / f"nifty50_index_{trade_date.strftime('%Y%m%d')}.csv"
+                row.to_csv(path, index=False)
+                index_paths.append(path)
+            if latest_available_only:
+                break
+        time.sleep(client.pause_seconds)
+
+    history = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    if history.empty:
+        return IndexHistoryResult(history_path=None, index_paths=tuple(index_paths), index_history=history)
+    history["trade_date"] = pd.to_datetime(history["trade_date"], errors="coerce")
+    history = history.dropna(subset=["trade_date"]).sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+    history["trade_date"] = history["trade_date"].dt.strftime("%Y-%m-%d")
+    history_path = index_history_dir / f"nifty50_index_history_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.csv"
+    history.to_csv(history_path, index=False)
+    return IndexHistoryResult(history_path=history_path, index_paths=tuple(index_paths), index_history=history)
 
 
 def get_financial_results(
@@ -528,6 +846,999 @@ def download_nse_fundamentals(
     )
 
 
+def get_bse_scrip_master(client: BSEArchiveClient) -> pd.DataFrame:
+    payload = client.get_json(
+        "/BseIndiaAPI/api/ListofScripData/w",
+        params={
+            "Group": "",
+            "Scripcode": "",
+            "industry": "",
+            "segment": "Equity",
+            "status": "Active",
+        },
+    )
+    df = normalize_bse_payload(payload)
+    if df.empty:
+        return pd.DataFrame()
+
+    normalized = df.copy()
+    normalized.columns = [str(col).strip() for col in normalized.columns]
+    rename_candidates = {
+        "scrip_code": ["ScripCode", "SCRIP_CD", "SecurityCode", "SC_CODE", "CODE"],
+        "scrip_id": ["ScripId", "ScripID", "SC_ID", "SecurityId", "SCRIP_ID"],
+        "company_name": ["ScripName", "SecurityName", "CompanyName", "SC_NAME", "NAME"],
+        "isin": ["ISIN", "ISIN_CODE", "ISINCode"],
+    }
+    rename_map = {}
+    lower_lookup = {col.lower(): col for col in normalized.columns}
+    for target, choices in rename_candidates.items():
+        for choice in choices:
+            source = lower_lookup.get(choice.lower())
+            if source is not None:
+                rename_map[source] = target
+                break
+    normalized = normalized.rename(columns=rename_map)
+    for col in ["scrip_code", "scrip_id", "company_name", "isin"]:
+        if col not in normalized.columns:
+            normalized[col] = ""
+    normalized["scrip_code"] = normalized["scrip_code"].astype(str).str.extract(r"(\d+)")[0]
+    normalized["scrip_id"] = normalized["scrip_id"].astype(str).str.upper().str.strip()
+    normalized["isin"] = normalized["isin"].astype(str).str.upper().str.strip()
+    normalized = normalized.dropna(subset=["scrip_code"])
+    return normalized[["scrip_code", "scrip_id", "company_name", "isin"]].drop_duplicates()
+
+
+def bse_quote_search(client: BSEArchiveClient, symbol: str) -> pd.DataFrame:
+    payload = client.get_json(
+        "https://api.bseindia.com/Msource/90D/getQouteSearch.aspx",
+        params={"Type": "EQ", "text": symbol},
+    )
+    return normalize_bse_payload(payload)
+
+
+def load_symbol_isin_map(output_dir: Path) -> pd.DataFrame:
+    latest_prices = latest_csv_file(output_dir / "prices_by_day", "nifty50_prices_*.csv")
+    if latest_prices is None:
+        latest_prices = latest_csv_file(output_dir, "nifty50_prices_*.csv")
+    if latest_prices is not None:
+        prices = pd.read_csv(latest_prices)
+        cols = [col for col in ["symbol", "isin", "instrument_name"] if col in prices.columns]
+        if {"symbol", "isin"}.issubset(cols):
+            return prices[cols].dropna(subset=["symbol", "isin"]).drop_duplicates("symbol")
+
+    constituents = load_latest_cached_constituents(output_dir)
+    if constituents is None:
+        return pd.DataFrame(columns=["symbol", "isin"])
+    cols = [col for col in ["symbol", "isin", "company_name"] if col in constituents.columns]
+    return constituents[cols].dropna(subset=["symbol"]).drop_duplicates("symbol")
+
+
+def map_symbols_to_bse_codes(
+    client: BSEArchiveClient,
+    symbols: Iterable[str],
+    output_dir: Path,
+    run_date: date,
+) -> pd.DataFrame:
+    symbols_df = load_symbol_isin_map(output_dir)
+    if symbols_df.empty:
+        symbols_df = pd.DataFrame({"symbol": list(symbols)})
+    symbols_df["symbol"] = symbols_df["symbol"].astype(str).str.upper().str.strip()
+    if "isin" not in symbols_df.columns:
+        symbols_df["isin"] = ""
+    symbols_df["isin"] = symbols_df["isin"].astype(str).str.upper().str.strip()
+    symbols_df = symbols_df[symbols_df["symbol"].isin({symbol.upper() for symbol in symbols})].copy()
+
+    cache_dir = output_dir / "fundamentals" / "bse_reference"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    master_path = cache_dir / f"bse_scrip_master_{run_date.strftime('%Y%m%d')}.csv"
+    try:
+        master = get_bse_scrip_master(client)
+        if not master.empty:
+            master.to_csv(master_path, index=False)
+    except Exception as exc:
+        print(f"BSE scrip master download failed: {exc}")
+        master = pd.read_csv(master_path) if master_path.exists() else pd.DataFrame()
+
+    mapped = symbols_df.copy()
+    mapped["bse_scrip_code"] = ""
+    mapped["bse_scrip_id"] = ""
+    mapped["bse_company_name"] = ""
+
+    if not master.empty and "isin" in master.columns:
+        by_isin = master.dropna(subset=["isin"]).drop_duplicates("isin")
+        mapped = mapped.merge(
+            by_isin[["isin", "scrip_code", "scrip_id", "company_name"]],
+            on="isin",
+            how="left",
+        )
+        mapped["bse_scrip_code"] = mapped["scrip_code"].fillna(mapped["bse_scrip_code"]).astype(str)
+        mapped["bse_scrip_id"] = mapped["scrip_id"].fillna(mapped["bse_scrip_id"]).astype(str)
+        mapped["bse_company_name"] = mapped["company_name"].fillna(mapped["bse_company_name"]).astype(str)
+        mapped = mapped.drop(columns=[col for col in ["scrip_code", "scrip_id", "company_name"] if col in mapped])
+
+    missing_mask = mapped["bse_scrip_code"].astype(str).str.strip().isin(["", "nan", "None"])
+    if not master.empty and "scrip_id" in master.columns and missing_mask.any():
+        by_scrip_id = master.dropna(subset=["scrip_id"]).drop_duplicates("scrip_id")
+        symbol_matches = mapped.loc[missing_mask, ["symbol"]].merge(
+            by_scrip_id[["scrip_id", "scrip_code", "company_name"]],
+            left_on="symbol",
+            right_on="scrip_id",
+            how="left",
+        )
+        for idx, match in zip(mapped.loc[missing_mask].index, symbol_matches.itertuples(index=False)):
+            if pd.notna(match.scrip_code):
+                mapped.loc[idx, "bse_scrip_code"] = str(match.scrip_code)
+                mapped.loc[idx, "bse_scrip_id"] = str(match.scrip_id)
+                mapped.loc[idx, "bse_company_name"] = str(match.company_name)
+
+    missing_mask = mapped["bse_scrip_code"].astype(str).str.strip().isin(["", "nan", "None"])
+    for idx, row in mapped[missing_mask].iterrows():
+        symbol = str(row["symbol"]).upper()
+        try:
+            search_df = bse_quote_search(client, symbol)
+        except Exception as exc:
+            print(f"BSE quote search failed for {symbol}: {exc}")
+            continue
+        if search_df.empty:
+            continue
+        search_df.columns = [str(col).strip() for col in search_df.columns]
+        best = search_df.iloc[0]
+        code = first_present(best, ["SecurityCode", "ScripCode", "SCRIP_CD", "SC_CODE", "code"])
+        scrip_id = first_present(best, ["SecurityId", "ScripId", "SCRIP_ID", "SC_ID", "symbol"], symbol)
+        name = first_present(best, ["SecurityName", "ScripName", "CompanyName", "name"])
+        if code:
+            mapped.loc[idx, "bse_scrip_code"] = code
+            mapped.loc[idx, "bse_scrip_id"] = scrip_id
+            mapped.loc[idx, "bse_company_name"] = name
+        time.sleep(client.pause_seconds)
+
+    mapped["bse_scrip_code"] = mapped["bse_scrip_code"].astype(str).str.extract(r"(\d+)")[0]
+    return mapped.dropna(subset=["bse_scrip_code"]).drop_duplicates("symbol")
+
+
+def get_bse_announcements(
+    client: BSEArchiveClient,
+    scrip_code: str,
+    from_date: date,
+    to_date: date,
+) -> pd.DataFrame:
+    frames = []
+    chunk_start = from_date
+    while chunk_start <= to_date:
+        chunk_end = min(date(chunk_start.year, 12, 31), to_date)
+        for page in range(1, 21):
+            payload = client.get_json(
+                "/BseIndiaAPI/api/AnnGetData/w",
+                params={
+                    "pageno": str(page),
+                    "strCat": "-1",
+                    "strPrevDate": chunk_start.strftime("%Y%m%d"),
+                    "strScrip": str(scrip_code),
+                    "strSearch": "P",
+                    "strToDate": chunk_end.strftime("%Y%m%d"),
+                    "strType": "C",
+                },
+            )
+            df = normalize_bse_payload(payload)
+            if df.empty:
+                break
+            frames.append(df)
+            if len(df) < 50:
+                break
+            time.sleep(client.pause_seconds)
+        chunk_start = chunk_end + timedelta(days=1)
+        time.sleep(client.pause_seconds)
+
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    if "NEWSID" in df.columns:
+        df = df.drop_duplicates(subset=["NEWSID"])
+    return df.drop_duplicates()
+
+
+def normalize_bse_filings(
+    filings: pd.DataFrame,
+    symbol: str,
+    scrip_code: str,
+    pulled_on: date,
+    pulled_at: str,
+    from_date: date,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if filings.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df = filings.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+    text_parts = []
+    for col in ["NEWSSUB", "HEADLINE", "MORE", "CATEGORYNAME", "SUBCATNAME", "NewsSub"]:
+        if col in df.columns:
+            text_parts.append(df[col].fillna("").astype(str))
+    text = text_parts[0] if text_parts else pd.Series("", index=df.index)
+    for part in text_parts[1:]:
+        text = text + " " + part
+    lower_text = text.str.lower()
+
+    result_mask = lower_text.str.contains("financial result|audited result|unaudited result|limited review", na=False)
+    exclude_mask = lower_text.str.contains(
+        "scheduled|schedule|transcript|audio recording|analyst meet|conference call|investor presentation",
+        na=False,
+    )
+    shareholding_mask = lower_text.str.contains("shareholding pattern|regulation 31", na=False)
+
+    announcement_dates = parse_date_series(
+        df.get(
+            "DissemDT",
+            df.get("NEWS_DT", df.get("DT_TM", df.get("News_submission_dt", pd.Series(dtype=str)))),
+        )
+    )
+    attachments = df.apply(
+        lambda row: bse_attachment_url(first_present(row, ["ATTACHMENTNAME", "NSURL", "ATTACHMENT", "attachment"])),
+        axis=1,
+    )
+    xbrl_urls = df.apply(
+        lambda row: bse_xbrl_url(first_present(row, ["XML_NAME", "XBRL", "XBRLFILE", "xbrl"])),
+        axis=1,
+    )
+    seq_ids = df.apply(lambda row: first_present(row, ["NEWSID", "NEWS_ID", "SLNO", "SCRIP_CD"], scrip_code), axis=1)
+    period_ends = text.map(parse_filing_period_end)
+
+    result_rows = df[result_mask & ~exclude_mask].copy()
+    if not result_rows.empty:
+        result_idx = result_rows.index
+        result_text = text.loc[result_idx]
+        result_periods = period_ends.loc[result_idx]
+        result_annual = result_text.str.lower().str.contains(
+            "quarter and year ended|year ended|financial year ended|audited financial results",
+            na=False,
+        ) & ~result_text.str.lower().str.contains("half year|nine months", na=False)
+        financial_announcements = pd.DataFrame(
+            {
+                "symbol": symbol,
+                "pulled_on": pulled_on.isoformat(),
+                "pulled_at": pulled_at,
+                "announcement_dt": announcement_dates.loc[result_idx].values,
+                "result_period_end": result_periods.values,
+                "is_annual_result": result_annual.values,
+                "desc": result_rows.get("CATEGORYNAME", pd.Series("", index=result_idx)).values,
+                "attchmntText": result_text.values,
+                "attchmntFile": attachments.loc[result_idx].values,
+                "hasXbrl": xbrl_urls.loc[result_idx].astype(str).ne("").values,
+                "seq_id": seq_ids.loc[result_idx].values,
+                "announcement_text": result_text.values,
+                "source": "bse",
+                "bse_scrip_code": scrip_code,
+            }
+        ).dropna(subset=["result_period_end"])
+        financial_results = pd.DataFrame(
+            {
+                "symbol": symbol,
+                "pulled_on": pulled_on.isoformat(),
+                "from_date": from_date.isoformat(),
+                "to_date": pulled_on.isoformat(),
+                "pulled_at": pulled_at,
+                "broadCastDate": announcement_dates.loc[result_idx].values,
+                "filingDate": announcement_dates.loc[result_idx].values,
+                "toDate": result_periods.values,
+                "period": np.where(result_annual.values, "Annual", "Quarterly"),
+                "requested_period": np.where(result_annual.values, "Annual", "Quarterly"),
+                "format": "bse_filings",
+                "xbrl": xbrl_urls.loc[result_idx].values,
+                "seqNumber": seq_ids.loc[result_idx].values,
+                "companyName": result_rows.get("SLONGNAME", pd.Series("", index=result_idx)).values,
+                "resultDescription": result_text.values,
+                "resultDetailedDataLink": attachments.loc[result_idx].values,
+                "source": "bse",
+                "bse_scrip_code": scrip_code,
+            }
+        ).dropna(subset=["toDate"])
+    else:
+        financial_announcements = pd.DataFrame()
+        financial_results = pd.DataFrame()
+
+    share_rows = df[shareholding_mask].copy()
+    if not share_rows.empty:
+        share_idx = share_rows.index
+        shareholding = pd.DataFrame(
+            {
+                "symbol": symbol,
+                "pulled_on": pulled_on.isoformat(),
+                "pulled_at": pulled_at,
+                "date": period_ends.loc[share_idx].values,
+                "submissionDate": announcement_dates.loc[share_idx].values,
+                "broadcastDate": announcement_dates.loc[share_idx].values,
+                "recordId": seq_ids.loc[share_idx].values,
+                "xbrl": xbrl_urls.loc[share_idx].values,
+                "desc": text.loc[share_idx].values,
+                "pr_and_prgrp": pd.NA,
+                "public_val": pd.NA,
+                "source": "bse",
+                "bse_scrip_code": scrip_code,
+                "attachment": attachments.loc[share_idx].values,
+            }
+        ).dropna(subset=["date"])
+    else:
+        shareholding = pd.DataFrame()
+
+    return financial_results, financial_announcements, shareholding
+
+
+def download_bse_fundamentals(
+    output_dir: Path = Path("data_cache/nse_equity"),
+    symbols: Iterable[str] | None = None,
+    limit: int | None = None,
+    run_date: date | None = None,
+    lookback_years: int = 8,
+) -> FundamentalsResult:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fundamentals_dir = output_dir / "fundamentals"
+    financial_dir = fundamentals_dir / "financial_results_by_day"
+    announcements_dir = fundamentals_dir / "financial_result_announcements_by_day"
+    shareholding_dir = fundamentals_dir / "shareholding_by_day"
+    raw_dir = fundamentals_dir / "bse_filings_by_day"
+    financial_dir.mkdir(parents=True, exist_ok=True)
+    announcements_dir.mkdir(parents=True, exist_ok=True)
+    shareholding_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    pulled_on = run_date or date.today()
+    from_date = date(pulled_on.year - max(lookback_years, 1), 1, 1)
+    pulled_stamp = pulled_on.strftime("%Y%m%d")
+    pulled_at = datetime.now().isoformat(timespec="seconds")
+
+    client = BSEArchiveClient()
+    if symbols:
+        pull_symbols = [symbol.upper() for symbol in symbols]
+        if limit is not None:
+            pull_symbols = pull_symbols[:limit]
+    else:
+        constituents = load_latest_cached_constituents(output_dir)
+        if constituents is None:
+            constituents = get_nifty_constituents(NSEArchiveClient())
+        pull_symbols = selected_nifty_symbols(constituents, symbols=symbols, limit=limit)
+
+    mapping = map_symbols_to_bse_codes(client, pull_symbols, output_dir, pulled_on)
+    if mapping.empty:
+        raise RuntimeError("BSE scrip mapping returned no symbols.")
+
+    mapping_path = fundamentals_dir / "bse_reference" / f"bse_symbol_map_{pulled_stamp}.csv"
+    mapping.to_csv(mapping_path, index=False)
+
+    financial_frames = []
+    announcement_frames = []
+    shareholding_frames = []
+    raw_frames = []
+    for row in mapping.itertuples(index=False):
+        symbol = str(row.symbol).upper()
+        scrip_code = str(row.bse_scrip_code)
+        filings = get_bse_announcements(client, scrip_code, from_date=from_date, to_date=pulled_on)
+        if not filings.empty:
+            filings.insert(0, "symbol", symbol)
+            filings.insert(1, "bse_scrip_code", scrip_code)
+            filings.insert(2, "pulled_on", pulled_on.isoformat())
+            filings.insert(3, "pulled_at", pulled_at)
+            raw_frames.append(filings)
+        financial_df, announcement_df, shareholding_df = normalize_bse_filings(
+            filings,
+            symbol=symbol,
+            scrip_code=scrip_code,
+            pulled_on=pulled_on,
+            pulled_at=pulled_at,
+            from_date=from_date,
+        )
+        if not financial_df.empty:
+            financial_frames.append(financial_df)
+        if not announcement_df.empty:
+            announcement_frames.append(announcement_df)
+        if not shareholding_df.empty:
+            shareholding_frames.append(shareholding_df)
+        time.sleep(client.pause_seconds)
+
+    financial_results = (
+        pd.concat(financial_frames, ignore_index=True, sort=False)
+        if financial_frames
+        else pd.DataFrame(columns=["symbol", "pulled_on", "from_date", "to_date", "pulled_at"])
+    )
+    financial_announcements = (
+        pd.concat(announcement_frames, ignore_index=True, sort=False)
+        if announcement_frames
+        else pd.DataFrame(columns=["symbol", "pulled_on", "pulled_at"])
+    )
+    shareholding = (
+        pd.concat(shareholding_frames, ignore_index=True, sort=False)
+        if shareholding_frames
+        else pd.DataFrame(columns=["symbol", "pulled_on", "pulled_at"])
+    )
+    raw_filings = pd.concat(raw_frames, ignore_index=True, sort=False) if raw_frames else pd.DataFrame()
+
+    financial_results_path = financial_dir / f"bse_financial_results_{pulled_stamp}.csv"
+    financial_announcements_path = announcements_dir / f"bse_financial_result_announcements_{pulled_stamp}.csv"
+    shareholding_path = shareholding_dir / f"bse_shareholding_pattern_{pulled_stamp}.csv"
+    raw_path = raw_dir / f"bse_filings_{pulled_stamp}.csv"
+    financial_results.to_csv(financial_results_path, index=False)
+    financial_announcements.to_csv(financial_announcements_path, index=False)
+    shareholding.to_csv(shareholding_path, index=False)
+    raw_filings.to_csv(raw_path, index=False)
+
+    return FundamentalsResult(
+        financial_results_path=financial_results_path,
+        financial_announcements_path=financial_announcements_path,
+        shareholding_path=shareholding_path,
+        financial_results=financial_results,
+        financial_announcements=financial_announcements,
+        shareholding=shareholding,
+    )
+
+
+def slug_from_url(url: str) -> str:
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    return parts[-2] if len(parts) >= 2 else ""
+
+
+def clean_company_name(value: str) -> str:
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"<[^>]+>", " ", value)
+    return " ".join(value.split())
+
+
+def period_header_to_date(value: str) -> pd.Timestamp:
+    text = clean_company_name(value).replace("'", " ")
+    text = re.sub(r"\bFY\b|\bQ[1-4]\b|Quarter|Year|Ended|Ending", " ", text, flags=re.IGNORECASE)
+    text = " ".join(text.replace("/", " ").replace("-", " ").split())
+    if not text:
+        return pd.NaT
+
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.notna(parsed):
+        if parsed.day == 1 and re.search(r"[A-Za-z]", text):
+            return parsed + pd.offsets.MonthEnd(0)
+        return parsed
+
+    match = re.search(
+        r"(Mar|March|Jun|June|Sep|Sept|September|Dec|December)\s+(\d{2,4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        month, year_text = match.groups()
+        year = int(year_text)
+        if year < 100:
+            year += 2000 if year < 70 else 1900
+        parsed = pd.to_datetime(f"{month} {year}", errors="coerce")
+        return parsed + pd.offsets.MonthEnd(0) if pd.notna(parsed) else pd.NaT
+    return pd.NaT
+
+
+def sanitize_metric_name(value: str) -> str:
+    value = clean_company_name(value).lower()
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    return value[:80] or "metric"
+
+
+def numeric_from_text(value: str) -> float | pd.NA:
+    text = clean_company_name(value)
+    if not text or text in {"--", "-", "N.A.", "NA"}:
+        return pd.NA
+    negative = text.startswith("(") and text.endswith(")")
+    text = re.sub(r"[%₹,]", "", text).replace("(", "").replace(")", "").strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return pd.NA
+    return -number if negative else number
+
+
+def extract_html_tables(text: str) -> list[list[list[str]]]:
+    parser = SimpleTableParser()
+    parser.feed(text)
+    return parser.tables
+
+
+def table_to_financial_rows(
+    table: list[list[str]],
+    symbol: str,
+    source: str,
+    source_url: str,
+    pulled_on: date,
+    pulled_at: str,
+    from_date: date,
+    requested_period: str,
+) -> list[dict]:
+    if len(table) < 2:
+        return []
+
+    header_idx = None
+    period_dates: list[pd.Timestamp] = []
+    for idx, row in enumerate(table[:8]):
+        dates = [period_header_to_date(cell) for cell in row[1:]]
+        valid_dates = [value for value in dates if pd.notna(value)]
+        if len(valid_dates) >= 2:
+            header_idx = idx
+            period_dates = dates
+            break
+    if header_idx is None:
+        return []
+
+    rows_by_period: list[dict] = []
+    for col_idx, period_end in enumerate(period_dates, start=1):
+        if pd.isna(period_end):
+            continue
+        row_data = {
+            "symbol": symbol,
+            "pulled_on": pulled_on.isoformat(),
+            "from_date": from_date.isoformat(),
+            "to_date": pulled_on.isoformat(),
+            "pulled_at": pulled_at,
+            "broadCastDate": period_end.date().isoformat(),
+            "filingDate": period_end.date().isoformat(),
+            "toDate": period_end.date().isoformat(),
+            "period": requested_period,
+            "requested_period": requested_period,
+            "format": source,
+            "xbrl": source_url,
+            "seqNumber": f"{source}_{symbol}_{requested_period}_{period_end.strftime('%Y%m%d')}",
+            "companyName": "",
+            "resultDescription": f"{source} {requested_period.lower()} financial table",
+            "resultDetailedDataLink": source_url,
+            "source": source,
+        }
+        for metric_row in table[header_idx + 1 :]:
+            if len(metric_row) <= col_idx:
+                continue
+            metric = sanitize_metric_name(metric_row[0])
+            if not metric:
+                continue
+            row_data[metric] = numeric_from_text(metric_row[col_idx])
+        rows_by_period.append(row_data)
+    return rows_by_period
+
+
+def rows_to_announcements(rows: pd.DataFrame, source: str) -> pd.DataFrame:
+    if rows.empty:
+        return pd.DataFrame(columns=["symbol", "pulled_on", "pulled_at"])
+    ann = rows[
+        [
+            "symbol",
+            "pulled_on",
+            "pulled_at",
+            "filingDate",
+            "toDate",
+            "requested_period",
+            "resultDescription",
+            "resultDetailedDataLink",
+            "seqNumber",
+            "source",
+        ]
+    ].copy()
+    ann = ann.rename(
+        columns={
+            "filingDate": "announcement_dt",
+            "toDate": "result_period_end",
+            "resultDescription": "desc",
+            "resultDetailedDataLink": "attchmntFile",
+            "seqNumber": "seq_id",
+        }
+    )
+    ann["is_annual_result"] = ann["requested_period"].astype(str).str.lower().eq("annual")
+    ann["attchmntText"] = source + " financial table"
+    ann["hasXbrl"] = ann["attchmntFile"].astype(str).str.startswith("http")
+    ann["announcement_text"] = ann["attchmntText"]
+    return ann.drop(columns=["requested_period"])
+
+
+def table_has_metric(table: list[list[str]], metric_pattern: str) -> bool:
+    return any(row and re.search(metric_pattern, row[0], flags=re.IGNORECASE) for row in table)
+
+
+def table_period_count(table: list[list[str]]) -> int:
+    if not table:
+        return 0
+    return sum(pd.notna(period_header_to_date(cell)) for cell in table[0][1:])
+
+
+def screener_shareholding_rows(
+    table: list[list[str]],
+    symbol: str,
+    source_url: str,
+    pulled_on: date,
+    pulled_at: str,
+) -> list[dict]:
+    if not table or not table[0]:
+        return []
+    period_dates = [period_header_to_date(cell) for cell in table[0][1:]]
+    promoter_values: dict[int, float | pd.NA] = {}
+    public_values: dict[int, float | pd.NA] = {}
+    for row in table[1:]:
+        if not row:
+            continue
+        label = clean_company_name(row[0]).lower()
+        if label.startswith("promoter"):
+            promoter_values = {
+                idx: numeric_from_text(value)
+                for idx, value in enumerate(row[1:], start=1)
+            }
+        elif label.startswith("public"):
+            public_values = {
+                idx: numeric_from_text(value)
+                for idx, value in enumerate(row[1:], start=1)
+            }
+
+    rows = []
+    for idx, period_end in enumerate(period_dates, start=1):
+        if pd.isna(period_end):
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "pulled_on": pulled_on.isoformat(),
+                "pulled_at": pulled_at,
+                "date": period_end.date().isoformat(),
+                "submissionDate": period_end.date().isoformat(),
+                "broadcastDate": period_end.date().isoformat(),
+                "recordId": f"screener_{symbol}_shareholding_{period_end.strftime('%Y%m%d')}",
+                "xbrl": source_url,
+                "desc": "screener shareholding table",
+                "pr_and_prgrp": promoter_values.get(idx, pd.NA),
+                "public_val": public_values.get(idx, pd.NA),
+                "source": "screener",
+            }
+        )
+    return rows
+
+
+def empty_shareholding_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["symbol", "pulled_on", "pulled_at", "source"])
+
+
+def moneycontrol_search(client: WebFundamentalsClient, symbol: str) -> dict:
+    url = (
+        f"{MONEYCONTROL_HOME}/mccode/common/autosuggestion_solr.php"
+        f"?classic=true&query={quote(symbol)}&type=1&format=json"
+    )
+    payload = client.get_json(url, referer=MONEYCONTROL_HOME)
+    items = payload if isinstance(payload, list) else []
+    if not items:
+        raise RuntimeError(f"Moneycontrol did not return a stock match for {symbol}.")
+    symbol_upper = symbol.upper()
+    ranked = sorted(
+        items,
+        key=lambda item: (
+            symbol_upper not in clean_company_name(str(item.get("pdt_dis_nm", ""))).upper(),
+            symbol_upper not in clean_company_name(str(item.get("name", ""))).upper(),
+        ),
+    )
+    item = ranked[0]
+    link = str(item.get("link_src", ""))
+    sc_id = str(item.get("sc_id") or link.rstrip("/").split("/")[-1]).strip()
+    stock_name = clean_company_name(str(item.get("stock_name") or item.get("name") or symbol))
+    slug = slug_from_url(link)
+    if not sc_id:
+        raise RuntimeError(f"Moneycontrol match for {symbol} did not include sc_id.")
+    return {"sc_id": sc_id, "stock_name": stock_name, "slug": slug, "link": link}
+
+
+def moneycontrol_financial_urls(match: dict, requested_period: str) -> list[str]:
+    sc_id = match["sc_id"]
+    slug = match.get("slug") or ""
+    stock_name = quote(match.get("stock_name") or sc_id)
+    urls = []
+    if slug:
+        result_path = "quarterly-results" if requested_period == "Quarterly" else "yearly-results"
+        urls.append(f"{MONEYCONTROL_HOME}/financials/{slug}/results/{result_path}/{sc_id}")
+    urls.append(f"{MONEYCONTROL_HOME}/stocks/hist_stock_result.php?ex=N&sc_id={sc_id}&mycomp={stock_name}")
+    return urls
+
+
+def download_moneycontrol_fundamentals(
+    output_dir: Path = Path("data_cache/nse_equity"),
+    symbols: Iterable[str] | None = None,
+    limit: int | None = None,
+    run_date: date | None = None,
+    lookback_years: int = 8,
+) -> FundamentalsResult:
+    return download_web_fundamentals(
+        source="moneycontrol",
+        output_dir=output_dir,
+        symbols=symbols,
+        limit=limit,
+        run_date=run_date,
+        lookback_years=lookback_years,
+    )
+
+
+def download_screener_fundamentals(
+    output_dir: Path = Path("data_cache/nse_equity"),
+    symbols: Iterable[str] | None = None,
+    limit: int | None = None,
+    run_date: date | None = None,
+    lookback_years: int = 8,
+) -> FundamentalsResult:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fundamentals_dir = output_dir / "fundamentals"
+    financial_dir = fundamentals_dir / "financial_results_by_day"
+    announcements_dir = fundamentals_dir / "financial_result_announcements_by_day"
+    shareholding_dir = fundamentals_dir / "shareholding_by_day"
+    raw_dir = fundamentals_dir / "screener_raw_by_day"
+    financial_dir.mkdir(parents=True, exist_ok=True)
+    announcements_dir.mkdir(parents=True, exist_ok=True)
+    shareholding_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    pulled_on = run_date or date.today()
+    from_date = date(pulled_on.year - max(lookback_years, 1), 1, 1)
+    pulled_stamp = pulled_on.strftime("%Y%m%d")
+    pulled_at = datetime.now().isoformat(timespec="seconds")
+    client = WebFundamentalsClient()
+    pull_symbols = selected_symbols_from_cache(output_dir, symbols=symbols, limit=limit)
+
+    financial_rows: list[dict] = []
+    shareholding_rows: list[dict] = []
+    raw_rows: list[dict] = []
+    errors = []
+    for symbol in pull_symbols:
+        urls = [
+            f"{SCREENER_HOME}/company/{quote(symbol)}/consolidated/",
+            f"{SCREENER_HOME}/company/{quote(symbol)}/",
+        ]
+        symbol_financial_rows: list[dict] = []
+        symbol_shareholding_rows: list[dict] = []
+        for url in urls:
+            try:
+                page_text = client.get_text(url, referer=SCREENER_HOME)
+            except Exception as exc:
+                errors.append(f"{symbol} {url}: {exc}")
+                continue
+            tables = extract_html_tables(page_text)
+            raw_rows.append(
+                {
+                    "symbol": symbol,
+                    "source": "screener",
+                    "url": url,
+                    "pulled_on": pulled_on.isoformat(),
+                    "pulled_at": pulled_at,
+                    "table_count": len(tables),
+                    "html_bytes": len(page_text),
+                }
+            )
+            financial_tables = [table for table in tables if table_has_metric(table, r"^(sales|revenue)")]
+            for idx, table in enumerate(financial_tables[:2]):
+                requested_period = "Quarterly" if idx == 0 else "Annual"
+                symbol_financial_rows.extend(
+                    table_to_financial_rows(
+                        table,
+                        symbol=symbol,
+                        source="screener",
+                        source_url=url,
+                        pulled_on=pulled_on,
+                        pulled_at=pulled_at,
+                        from_date=from_date,
+                        requested_period=requested_period,
+                    )
+                )
+            shareholding_tables = [
+                table
+                for table in tables
+                if table_has_metric(table, r"^promoters?") and table_has_metric(table, r"^public")
+            ]
+            for table in shareholding_tables[:1]:
+                symbol_shareholding_rows.extend(
+                    screener_shareholding_rows(
+                        table,
+                        symbol=symbol,
+                        source_url=url,
+                        pulled_on=pulled_on,
+                        pulled_at=pulled_at,
+                    )
+                )
+            if symbol_financial_rows:
+                break
+        if not symbol_financial_rows:
+            errors.append(f"{symbol}: Screener did not return parseable financial tables.")
+        financial_rows.extend(symbol_financial_rows)
+        shareholding_rows.extend(symbol_shareholding_rows)
+        time.sleep(client.pause_seconds)
+
+    financial_results = pd.DataFrame(financial_rows)
+    if not financial_results.empty:
+        financial_results = financial_results.drop_duplicates(subset=["symbol", "requested_period", "toDate"])
+        financial_results = financial_results.sort_values(["symbol", "requested_period", "toDate"])
+    financial_announcements = rows_to_announcements(financial_results, source="screener")
+    shareholding = pd.DataFrame(shareholding_rows)
+    if shareholding.empty:
+        shareholding = empty_shareholding_frame()
+    else:
+        shareholding = shareholding.drop_duplicates(subset=["symbol", "date"]).sort_values(["symbol", "date"])
+    raw = pd.DataFrame(raw_rows + [{"symbol": "", "source": "screener", "error": err} for err in errors])
+
+    if financial_results.empty:
+        raise RuntimeError(
+            "screener fundamentals did not produce financial result rows. "
+            f"First errors: {'; '.join(errors[:3]) if errors else 'no parseable Screener tables found'}"
+        )
+
+    financial_results_path = financial_dir / f"screener_financial_results_{pulled_stamp}.csv"
+    financial_announcements_path = announcements_dir / f"screener_financial_result_announcements_{pulled_stamp}.csv"
+    shareholding_path = shareholding_dir / f"screener_shareholding_pattern_{pulled_stamp}.csv"
+    raw_path = raw_dir / f"screener_raw_{pulled_stamp}.csv"
+    financial_results.to_csv(financial_results_path, index=False)
+    financial_announcements.to_csv(financial_announcements_path, index=False)
+    shareholding.to_csv(shareholding_path, index=False)
+    raw.to_csv(raw_path, index=False)
+
+    return FundamentalsResult(
+        financial_results_path=financial_results_path,
+        financial_announcements_path=financial_announcements_path,
+        shareholding_path=shareholding_path,
+        financial_results=financial_results,
+        financial_announcements=financial_announcements,
+        shareholding=shareholding,
+    )
+
+
+def economic_times_search(client: WebFundamentalsClient, symbol: str) -> dict:
+    search_url = f"{ECONOMIC_TIMES_HOME}/markets/stocks/stock-quotes?ticker={quote(symbol)}"
+    text = client.get_text(search_url, referer=ECONOMIC_TIMES_HOME)
+    company_match = re.search(r"/([^/]+?)/stocks/companyid-(\d+)\.cms", text)
+    if not company_match:
+        company_match = re.search(r"companyid-(\d+)\.cms", text)
+        if not company_match:
+            raise RuntimeError(f"Economic Times did not return a company id for {symbol}.")
+        company_id = company_match.group(1)
+        slug = symbol.lower()
+    else:
+        slug, company_id = company_match.groups()
+    return {
+        "company_id": company_id,
+        "slug": slug,
+        "link": f"{ECONOMIC_TIMES_HOME}/{slug}/stocks/companyid-{company_id}.cms",
+    }
+
+
+def economic_times_financial_urls(match: dict, requested_period: str) -> list[str]:
+    return [match["link"]]
+
+
+def download_economic_times_fundamentals(
+    output_dir: Path = Path("data_cache/nse_equity"),
+    symbols: Iterable[str] | None = None,
+    limit: int | None = None,
+    run_date: date | None = None,
+    lookback_years: int = 8,
+) -> FundamentalsResult:
+    return download_web_fundamentals(
+        source="economictimes",
+        output_dir=output_dir,
+        symbols=symbols,
+        limit=limit,
+        run_date=run_date,
+        lookback_years=lookback_years,
+    )
+
+
+def selected_symbols_from_cache(output_dir: Path, symbols: Iterable[str] | None, limit: int | None) -> list[str]:
+    if symbols:
+        pull_symbols = [symbol.upper() for symbol in symbols]
+        return pull_symbols[:limit] if limit is not None else pull_symbols
+    constituents = load_latest_cached_constituents(output_dir)
+    if constituents is None:
+        constituents = get_nifty_constituents(NSEArchiveClient())
+    return selected_nifty_symbols(constituents, symbols=symbols, limit=limit)
+
+
+def download_web_fundamentals(
+    source: str,
+    output_dir: Path = Path("data_cache/nse_equity"),
+    symbols: Iterable[str] | None = None,
+    limit: int | None = None,
+    run_date: date | None = None,
+    lookback_years: int = 8,
+) -> FundamentalsResult:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fundamentals_dir = output_dir / "fundamentals"
+    financial_dir = fundamentals_dir / "financial_results_by_day"
+    announcements_dir = fundamentals_dir / "financial_result_announcements_by_day"
+    shareholding_dir = fundamentals_dir / "shareholding_by_day"
+    raw_dir = fundamentals_dir / f"{source}_raw_by_day"
+    financial_dir.mkdir(parents=True, exist_ok=True)
+    announcements_dir.mkdir(parents=True, exist_ok=True)
+    shareholding_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    pulled_on = run_date or date.today()
+    from_date = date(pulled_on.year - max(lookback_years, 1), 1, 1)
+    pulled_stamp = pulled_on.strftime("%Y%m%d")
+    pulled_at = datetime.now().isoformat(timespec="seconds")
+    client = WebFundamentalsClient()
+    pull_symbols = selected_symbols_from_cache(output_dir, symbols=symbols, limit=limit)
+
+    financial_rows: list[dict] = []
+    raw_rows: list[dict] = []
+    errors = []
+    for symbol in pull_symbols:
+        try:
+            if source == "moneycontrol":
+                match = moneycontrol_search(client, symbol)
+                url_builder = moneycontrol_financial_urls
+            elif source == "economictimes":
+                match = economic_times_search(client, symbol)
+                url_builder = economic_times_financial_urls
+            else:
+                raise ValueError(f"Unsupported web fundamentals source: {source}")
+
+            for requested_period in ("Quarterly", "Annual"):
+                period_rows: list[dict] = []
+                for url in url_builder(match, requested_period):
+                    try:
+                        page_text = client.get_text(url, referer=match.get("link"))
+                    except Exception as exc:
+                        errors.append(f"{symbol} {requested_period} {url}: {exc}")
+                        continue
+                    tables = extract_html_tables(page_text)
+                    raw_rows.append(
+                        {
+                            "symbol": symbol,
+                            "source": source,
+                            "requested_period": requested_period,
+                            "url": url,
+                            "pulled_on": pulled_on.isoformat(),
+                            "pulled_at": pulled_at,
+                            "table_count": len(tables),
+                            "html_bytes": len(page_text),
+                        }
+                    )
+                    for table in tables:
+                        period_rows.extend(
+                            table_to_financial_rows(
+                                table,
+                                symbol=symbol,
+                                source=source,
+                                source_url=url,
+                                pulled_on=pulled_on,
+                                pulled_at=pulled_at,
+                                from_date=from_date,
+                                requested_period=requested_period,
+                            )
+                        )
+                    if period_rows:
+                        break
+                financial_rows.extend(period_rows)
+            time.sleep(client.pause_seconds)
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
+
+    financial_results = pd.DataFrame(financial_rows)
+    if not financial_results.empty:
+        financial_results = financial_results.drop_duplicates(subset=["symbol", "requested_period", "toDate"])
+        financial_results = financial_results.sort_values(["symbol", "requested_period", "toDate"])
+    financial_announcements = rows_to_announcements(financial_results, source=source)
+    shareholding = empty_shareholding_frame()
+    raw = pd.DataFrame(raw_rows + [{"symbol": "", "source": source, "error": err} for err in errors])
+
+    if financial_results.empty:
+        raise RuntimeError(
+            f"{source} fundamentals did not produce financial result rows. "
+            f"First errors: {'; '.join(errors[:3]) if errors else 'no parseable provider tables found'}"
+        )
+
+    financial_results_path = financial_dir / f"{source}_financial_results_{pulled_stamp}.csv"
+    financial_announcements_path = announcements_dir / f"{source}_financial_result_announcements_{pulled_stamp}.csv"
+    shareholding_path = shareholding_dir / f"{source}_shareholding_pattern_{pulled_stamp}.csv"
+    raw_path = raw_dir / f"{source}_raw_{pulled_stamp}.csv"
+    financial_results.to_csv(financial_results_path, index=False)
+    financial_announcements.to_csv(financial_announcements_path, index=False)
+    shareholding.to_csv(shareholding_path, index=False)
+    raw.to_csv(raw_path, index=False)
+
+    return FundamentalsResult(
+        financial_results_path=financial_results_path,
+        financial_announcements_path=financial_announcements_path,
+        shareholding_path=shareholding_path,
+        financial_results=financial_results,
+        financial_announcements=financial_announcements,
+        shareholding=shareholding,
+    )
+
+
 def recency_points(days: float | None, buckets: list[tuple[int, int]], stale_points: int = 0) -> int:
     if days is None or pd.isna(days):
         return stale_points
@@ -551,15 +1862,207 @@ def days_between(later: pd.Timestamp, earlier: pd.Timestamp) -> int | pd.NA:
     return int((later - earlier).days)
 
 
+def bounded_score(value: float | int | pd.NA, low: float, high: float, points: float) -> float:
+    if pd.isna(value):
+        return 0.0
+    value = float(value)
+    if high == low:
+        return points if value >= high else 0.0
+    return max(0.0, min(points, (value - low) / (high - low) * points))
+
+
+def inverse_bounded_score(value: float | int | pd.NA, low: float, high: float, points: float) -> float:
+    if pd.isna(value):
+        return 0.0
+    value = float(value)
+    if high == low:
+        return points if value <= low else 0.0
+    return max(0.0, min(points, (high - value) / (high - low) * points))
+
+
+def pct_change_between(current: float | int | pd.NA, previous: float | int | pd.NA) -> float | pd.NA:
+    if pd.isna(current) or pd.isna(previous):
+        return pd.NA
+    previous = float(previous)
+    if abs(previous) < 1e-9:
+        return pd.NA
+    return (float(current) / previous - 1.0) * 100.0
+
+
+def latest_numeric(frame: pd.DataFrame, column: str) -> float | pd.NA:
+    if frame.empty or column not in frame.columns:
+        return pd.NA
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    return values.iloc[-1] if not values.empty else pd.NA
+
+
+def prior_numeric(frame: pd.DataFrame, column: str, periods_back: int = 1) -> float | pd.NA:
+    if frame.empty or column not in frame.columns:
+        return pd.NA
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    if len(values) <= periods_back:
+        return pd.NA
+    return values.iloc[-1 - periods_back]
+
+
+def revenue_column(frame: pd.DataFrame) -> str | None:
+    if "sales" in frame.columns and pd.to_numeric(frame["sales"], errors="coerce").notna().any():
+        return "sales"
+    if "revenue" in frame.columns and pd.to_numeric(frame["revenue"], errors="coerce").notna().any():
+        return "revenue"
+    return None
+
+
+def latest_margin(frame: pd.DataFrame) -> float | pd.NA:
+    margin = latest_numeric(frame, "opm")
+    if pd.isna(margin):
+        margin = latest_numeric(frame, "financing_margin")
+    return margin
+
+
+def compute_financial_quality_scores(quarterly: pd.DataFrame, annual: pd.DataFrame) -> dict:
+    metrics: dict[str, float | int | pd.NA] = {}
+    q = quarterly.sort_values("period_end_dt").copy() if not quarterly.empty else quarterly.copy()
+    a = annual.sort_values("period_end_dt").copy() if not annual.empty else annual.copy()
+    q_revenue_col = revenue_column(q)
+    a_revenue_col = revenue_column(a)
+
+    q_revenue = latest_numeric(q, q_revenue_col) if q_revenue_col else pd.NA
+    q_revenue_yoy = pct_change_between(q_revenue, prior_numeric(q, q_revenue_col, 4)) if q_revenue_col else pd.NA
+    q_revenue_qoq = pct_change_between(q_revenue, prior_numeric(q, q_revenue_col, 1)) if q_revenue_col else pd.NA
+    q_profit = latest_numeric(q, "net_profit")
+    q_profit_yoy = pct_change_between(q_profit, prior_numeric(q, "net_profit", 4))
+    q_profit_qoq = pct_change_between(q_profit, prior_numeric(q, "net_profit", 1))
+    q_eps = latest_numeric(q, "eps_in_rs")
+    q_eps_yoy = pct_change_between(q_eps, prior_numeric(q, "eps_in_rs", 4))
+
+    a_revenue = latest_numeric(a, a_revenue_col) if a_revenue_col else pd.NA
+    a_revenue_3y_ago = prior_numeric(a, a_revenue_col, 3) if a_revenue_col else pd.NA
+    a_revenue_3y_cagr = (
+        ((float(a_revenue) / float(a_revenue_3y_ago)) ** (1 / 3) - 1) * 100
+        if pd.notna(a_revenue) and pd.notna(a_revenue_3y_ago) and float(a_revenue_3y_ago) > 0
+        else pd.NA
+    )
+    a_profit = latest_numeric(a, "net_profit")
+    a_profit_3y_ago = prior_numeric(a, "net_profit", 3)
+    a_profit_3y_cagr = (
+        ((float(a_profit) / float(a_profit_3y_ago)) ** (1 / 3) - 1) * 100
+        if pd.notna(a_profit) and pd.notna(a_profit_3y_ago) and float(a_profit_3y_ago) > 0 and float(a_profit) > 0
+        else pd.NA
+    )
+
+    latest_opm = latest_margin(q)
+    previous_opm = prior_numeric(q, "opm", 4)
+    if pd.isna(previous_opm):
+        previous_opm = prior_numeric(q, "financing_margin", 4)
+    opm_yoy_change = float(latest_opm) - float(previous_opm) if pd.notna(latest_opm) and pd.notna(previous_opm) else pd.NA
+    net_margin = (
+        float(q_profit) / float(q_revenue) * 100
+        if pd.notna(q_profit) and pd.notna(q_revenue) and abs(float(q_revenue)) > 1e-9
+        else pd.NA
+    )
+    interest = latest_numeric(q, "interest")
+    interest_to_revenue = (
+        float(interest) / float(q_revenue) * 100
+        if pd.notna(interest) and pd.notna(q_revenue) and abs(float(q_revenue)) > 1e-9
+        else pd.NA
+    )
+    expense = latest_numeric(q, "expenses")
+    expense_ratio = (
+        float(expense) / float(q_revenue) * 100
+        if pd.notna(expense) and pd.notna(q_revenue) and abs(float(q_revenue)) > 1e-9
+        else pd.NA
+    )
+    previous_expense = prior_numeric(q, "expenses", 4)
+    previous_revenue = prior_numeric(q, q_revenue_col, 4) if q_revenue_col else pd.NA
+    previous_expense_ratio = (
+        float(previous_expense) / float(previous_revenue) * 100
+        if pd.notna(previous_expense) and pd.notna(previous_revenue) and abs(float(previous_revenue)) > 1e-9
+        else pd.NA
+    )
+    expense_ratio_yoy_change = (
+        float(expense_ratio) - float(previous_expense_ratio)
+        if pd.notna(expense_ratio) and pd.notna(previous_expense_ratio)
+        else pd.NA
+    )
+    gross_npa = latest_numeric(q, "gross_npa")
+    net_npa = latest_numeric(q, "net_npa")
+    dividend_payout = latest_numeric(a, "dividend_payout")
+
+    recent_profits = pd.to_numeric(q.get("net_profit", pd.Series(dtype=float)), errors="coerce").dropna().tail(4)
+    positive_profit_quarters = int((recent_profits > 0).sum()) if not recent_profits.empty else 0
+    recent_revenue = pd.to_numeric(q[q_revenue_col], errors="coerce").dropna().tail(4) if q_revenue_col else pd.Series(dtype=float)
+    positive_revenue_quarters = int((recent_revenue > 0).sum()) if not recent_revenue.empty else 0
+
+    growth_score = (
+        bounded_score(q_revenue_yoy, -10, 20, 7)
+        + bounded_score(q_profit_yoy, -20, 30, 7)
+        + bounded_score(a_revenue_3y_cagr, 0, 18, 5)
+        + bounded_score(a_profit_3y_cagr, 0, 20, 4)
+        + bounded_score(q_eps_yoy, -15, 25, 2)
+    )
+    profitability_score = (
+        bounded_score(latest_opm, 5, 25, 7)
+        + bounded_score(opm_yoy_change, -4, 4, 4)
+        + bounded_score(net_margin, 0, 15, 5)
+        + bounded_score(positive_profit_quarters, 1, 4, 4)
+    )
+    efficiency_score = (
+        inverse_bounded_score(interest_to_revenue, 2, 25, 4)
+        + inverse_bounded_score(expense_ratio_yoy_change, -5, 8, 4)
+        + bounded_score(positive_revenue_quarters, 1, 4, 3)
+        + inverse_bounded_score(gross_npa, 1, 8, 2)
+        + inverse_bounded_score(net_npa, 0.5, 4, 2)
+    )
+    shareholder_return_score = bounded_score(dividend_payout, 0, 35, 5)
+
+    metrics.update(
+        {
+            "growth_score": round(growth_score, 2),
+            "profitability_score": round(profitability_score, 2),
+            "efficiency_score": round(efficiency_score, 2),
+            "shareholder_return_score": round(shareholder_return_score, 2),
+            "latest_revenue": q_revenue,
+            "latest_net_profit": q_profit,
+            "latest_eps": q_eps,
+            "latest_margin": latest_opm,
+            "latest_net_margin": net_margin,
+            "latest_interest_to_revenue": interest_to_revenue,
+            "latest_expense_ratio": expense_ratio,
+            "latest_gross_npa": gross_npa,
+            "latest_net_npa": net_npa,
+            "latest_dividend_payout": dividend_payout,
+            "quarterly_revenue_yoy_pct": q_revenue_yoy,
+            "quarterly_revenue_qoq_pct": q_revenue_qoq,
+            "quarterly_profit_yoy_pct": q_profit_yoy,
+            "quarterly_profit_qoq_pct": q_profit_qoq,
+            "quarterly_eps_yoy_pct": q_eps_yoy,
+            "annual_revenue_3y_cagr_pct": a_revenue_3y_cagr,
+            "annual_profit_3y_cagr_pct": a_profit_3y_cagr,
+            "margin_yoy_change_pct": opm_yoy_change,
+            "expense_ratio_yoy_change_pct": expense_ratio_yoy_change,
+            "positive_profit_quarters": positive_profit_quarters,
+            "positive_revenue_quarters": positive_revenue_quarters,
+        }
+    )
+    return metrics
+
+
 def latest_previous_score_file(scores_dir: Path, score_date: date) -> Path | None:
     if not scores_dir.exists():
         return None
-    current_name = f"nse_fundamental_scores_{score_date.strftime('%Y%m%d')}.csv"
-    candidates = sorted(
-        path for path in scores_dir.glob("nse_fundamental_scores_*.csv")
-        if path.name < current_name
-    )
-    return candidates[-1] if candidates else None
+    candidates = []
+    for pattern in ("screener_fundamental_scores_*.csv", "nse_fundamental_scores_*.csv"):
+        for path in scores_dir.glob(pattern):
+            date_text = path.stem.rsplit("_", 1)[-1]
+            try:
+                path_date = datetime.strptime(date_text, "%Y%m%d").date()
+            except ValueError:
+                continue
+            if path_date < score_date:
+                candidates.append((path_date, 0 if path.name.startswith("nse_") else 1, path))
+    candidates = sorted(set(candidates))
+    return candidates[-1][2] if candidates else None
 
 
 def latest_csv_file(directory: Path, pattern: str) -> Path | None:
@@ -569,19 +2072,47 @@ def latest_csv_file(directory: Path, pattern: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def latest_csv_file_any(directory: Path, patterns: Iterable[str]) -> Path | None:
+    if not directory.exists():
+        return None
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(directory.glob(pattern))
+    candidates = sorted(set(candidates))
+    return candidates[-1] if candidates else None
+
+
 def load_latest_cached_fundamentals(output_dir: Path) -> FundamentalsResult:
     fundamentals_dir = output_dir / "fundamentals"
-    financial_path = latest_csv_file(
+    financial_path = latest_csv_file_any(
         fundamentals_dir / "financial_results_by_day",
-        "nse_financial_results_*.csv",
+        [
+            "screener_financial_results_*.csv",
+            "moneycontrol_financial_results_*.csv",
+            "economictimes_financial_results_*.csv",
+            "nse_financial_results_*.csv",
+            "bse_financial_results_*.csv",
+        ],
     )
-    announcements_path = latest_csv_file(
+    announcements_path = latest_csv_file_any(
         fundamentals_dir / "financial_result_announcements_by_day",
-        "nse_financial_result_announcements_*.csv",
+        [
+            "screener_financial_result_announcements_*.csv",
+            "moneycontrol_financial_result_announcements_*.csv",
+            "economictimes_financial_result_announcements_*.csv",
+            "nse_financial_result_announcements_*.csv",
+            "bse_financial_result_announcements_*.csv",
+        ],
     )
-    shareholding_path = latest_csv_file(
+    shareholding_path = latest_csv_file_any(
         fundamentals_dir / "shareholding_by_day",
-        "nse_shareholding_pattern_*.csv",
+        [
+            "screener_shareholding_pattern_*.csv",
+            "moneycontrol_shareholding_pattern_*.csv",
+            "economictimes_shareholding_pattern_*.csv",
+            "nse_shareholding_pattern_*.csv",
+            "bse_shareholding_pattern_*.csv",
+        ],
     )
 
     missing = [
@@ -654,8 +2185,17 @@ def score_symbol_fundamentals(
     filing_consistency_score = 0
     shareholding_recency_score = 0
     promoter_score = 0
+    shareholding_trend_score = 0
     latest_promoter_holding = pd.NA
     latest_public_holding = pd.NA
+    promoter_holding_qoq_change = pd.NA
+    public_holding_qoq_change = pd.NA
+    financial_quality = {
+        "growth_score": 0,
+        "profitability_score": 0,
+        "efficiency_score": 0,
+        "shareholder_return_score": 0,
+    }
 
     if not fin.empty:
         fin["period_end_dt"] = parse_date_series(fin.get("toDate", pd.Series(dtype=str)))
@@ -712,6 +2252,7 @@ def score_symbol_fundamentals(
         quarterly_period_count = q_unique
         annual_period_count = a_unique
         filing_consistency_score = min(7, q_unique) + min(3, a_unique)
+        financial_quality = compute_financial_quality_scores(quarterly, annual)
 
     if not ann.empty:
         ann["announcement_period_end_dt"] = parse_date_series(ann.get("result_period_end", pd.Series(dtype=str)))
@@ -773,25 +2314,50 @@ def score_symbol_fundamentals(
                     promoter_score = 8
                 elif latest_promoter_holding > 0:
                     promoter_score = 5
+            shp_sorted = shp.sort_values(["shareholding_dt", "shareholding_submission_dt"])
+            promoter_series = pd.to_numeric(shp_sorted.get("pr_and_prgrp"), errors="coerce").dropna()
+            public_series = pd.to_numeric(shp_sorted.get("public_val"), errors="coerce").dropna()
+            if len(promoter_series) >= 2:
+                promoter_holding_qoq_change = promoter_series.iloc[-1] - promoter_series.iloc[-2]
+                shareholding_trend_score += bounded_score(promoter_holding_qoq_change, -1.0, 1.0, 4)
+            if len(public_series) >= 2:
+                public_holding_qoq_change = public_series.iloc[-1] - public_series.iloc[-2]
+                shareholding_trend_score += inverse_bounded_score(public_holding_qoq_change, -1.0, 1.0, 2)
 
-    computed_score = (
-        quarterly_recency_score
-        + annual_recency_score
-        + disclosure_score
-        + filing_consistency_score
-        + shareholding_recency_score
-        + promoter_score
+    freshness_score = (
+        min(4, quarterly_recency_score / 30 * 4)
+        + min(3, annual_recency_score / 20 * 3)
+        + min(2, shareholding_recency_score / 15 * 2)
+        + min(1, filing_consistency_score / 10)
     )
+    shareholding_quality_score = min(15, promoter_score * 0.7 + shareholding_trend_score + min(2, shareholding_recency_score / 15 * 2))
+    computed_score = (
+        float(financial_quality.get("growth_score", 0) or 0)
+        + float(financial_quality.get("profitability_score", 0) or 0)
+        + float(financial_quality.get("efficiency_score", 0) or 0)
+        + float(financial_quality.get("shareholder_return_score", 0) or 0)
+        + shareholding_quality_score
+        + freshness_score
+    )
+    computed_score = max(0, min(100, computed_score))
 
     return {
         "symbol": symbol,
         "computed_score": int(round(computed_score)),
+        "growth_score": financial_quality.get("growth_score", 0),
+        "profitability_score": financial_quality.get("profitability_score", 0),
+        "efficiency_score": financial_quality.get("efficiency_score", 0),
+        "shareholder_return_score": financial_quality.get("shareholder_return_score", 0),
+        "shareholding_quality_score": round(shareholding_quality_score, 2),
+        "freshness_score": round(freshness_score, 2),
         "quarterly_recency_score": quarterly_recency_score,
         "annual_recency_score": annual_recency_score,
         "disclosure_score": disclosure_score,
         "filing_consistency_score": filing_consistency_score,
         "shareholding_recency_score": shareholding_recency_score,
         "promoter_score": promoter_score,
+        "shareholding_trend_score": round(shareholding_trend_score, 2),
+        **financial_quality,
         "quarterly_recency_days": days_between(score_dt, latest_quarter_end),
         "annual_recency_days": days_between(score_dt, latest_annual_end),
         "shareholding_recency_days": days_between(score_dt, latest_shareholding_date),
@@ -820,6 +2386,8 @@ def score_symbol_fundamentals(
         "latest_shareholding_xbrl": latest_shareholding_xbrl,
         "latest_promoter_holding": latest_promoter_holding,
         "latest_public_holding": latest_public_holding,
+        "promoter_holding_qoq_change": promoter_holding_qoq_change,
+        "public_holding_qoq_change": public_holding_qoq_change,
     }
 
 
@@ -893,12 +2461,40 @@ def generate_fundamental_scores(
         "previous_score",
         "score_changed",
         "score_source",
+        "growth_score",
+        "profitability_score",
+        "efficiency_score",
+        "shareholder_return_score",
+        "shareholding_quality_score",
+        "freshness_score",
         "quarterly_recency_score",
         "annual_recency_score",
         "disclosure_score",
         "filing_consistency_score",
         "shareholding_recency_score",
         "promoter_score",
+        "shareholding_trend_score",
+        "latest_revenue",
+        "latest_net_profit",
+        "latest_eps",
+        "latest_margin",
+        "latest_net_margin",
+        "latest_interest_to_revenue",
+        "latest_expense_ratio",
+        "latest_gross_npa",
+        "latest_net_npa",
+        "latest_dividend_payout",
+        "quarterly_revenue_yoy_pct",
+        "quarterly_revenue_qoq_pct",
+        "quarterly_profit_yoy_pct",
+        "quarterly_profit_qoq_pct",
+        "quarterly_eps_yoy_pct",
+        "annual_revenue_3y_cagr_pct",
+        "annual_profit_3y_cagr_pct",
+        "margin_yoy_change_pct",
+        "expense_ratio_yoy_change_pct",
+        "positive_profit_quarters",
+        "positive_revenue_quarters",
         "quarterly_recency_days",
         "annual_recency_days",
         "shareholding_recency_days",
@@ -927,11 +2523,13 @@ def generate_fundamental_scores(
         "latest_shareholding_xbrl",
         "latest_promoter_holding",
         "latest_public_holding",
+        "promoter_holding_qoq_change",
+        "public_holding_qoq_change",
         "previous_score_file",
     ]
     scores = scores[[col for col in ordered_cols if col in scores.columns]]
 
-    scores_path = scores_dir / f"nse_fundamental_scores_{score_on.strftime('%Y%m%d')}.csv"
+    scores_path = scores_dir / f"screener_fundamental_scores_{score_on.strftime('%Y%m%d')}.csv"
     scores.to_csv(scores_path, index=False)
     return FundamentalScoreResult(scores_path=scores_path, scores=scores)
 
@@ -1020,7 +2618,7 @@ def generate_fundamental_score_history(
     history_dir = output_dir / "fundamentals" / "fundamental_scores_history"
     history_dir.mkdir(parents=True, exist_ok=True)
     history_path = history_dir / (
-        f"nse_fundamental_scores_history_{score_dates[0].strftime('%Y%m%d')}_"
+        f"screener_fundamental_scores_history_{score_dates[0].strftime('%Y%m%d')}_"
         f"{score_dates[-1].strftime('%Y%m%d')}.csv"
     )
     history.to_csv(history_path, index=False)
@@ -1260,6 +2858,18 @@ def latest_required_csv(directory: Path, pattern: str, label: str) -> Path:
     return path
 
 
+def latest_required_csv_any(directory: Path, patterns: Iterable[str], label: str) -> Path:
+    if not directory.exists():
+        raise RuntimeError(f"Missing {label}; generate score history before running backtests.")
+    candidates = []
+    for priority, pattern in enumerate(patterns):
+        for path in directory.glob(pattern):
+            candidates.append((priority, path.name, path))
+    if not candidates:
+        raise RuntimeError(f"Missing {label}; generate score history before running backtests.")
+    return sorted(candidates)[-1][2]
+
+
 def backtest_metrics(returns: pd.Series, trading_days: int = 252) -> dict[str, float | int]:
     daily = pd.to_numeric(returns, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
     if daily.empty:
@@ -1293,7 +2903,104 @@ def backtest_metrics(returns: pd.Series, trading_days: int = 252) -> dict[str, f
     }
 
 
-def add_benchmark_columns(backtest: pd.DataFrame, prices: pd.DataFrame, initial_capital: float) -> pd.DataFrame:
+def load_nifty_index_history(output_dir: Path = Path("data_cache/nse_equity")) -> pd.DataFrame:
+    files = sorted((output_dir / "index_history").glob("nifty50_index_history_*.csv"))
+    files.extend(sorted((output_dir / "index_by_day").glob("nifty50_index_*.csv")))
+    frames = [pd.read_csv(path) for path in files if path.exists()]
+    history = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    if history.empty or "trade_date" not in history or "close" not in history:
+        return pd.DataFrame()
+    history = history.copy()
+    history["trade_date"] = pd.to_datetime(history["trade_date"], errors="coerce")
+    history["close"] = pd.to_numeric(history["close"], errors="coerce")
+    history = history.dropna(subset=["trade_date", "close"]).sort_values("trade_date")
+    return history.drop_duplicates("trade_date", keep="last").reset_index(drop=True)
+
+
+def relative_strength_index(close: pd.Series, window: int = 14) -> pd.Series:
+    delta = pd.to_numeric(close, errors="coerce").diff()
+    gain = delta.clip(lower=0).rolling(window, min_periods=window).mean()
+    loss = (-delta.clip(upper=0)).rolling(window, min_periods=window).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).fillna(50)
+
+
+def nifty_index_dashboard_payload(output_dir: Path = Path("data_cache/nse_equity")) -> dict | None:
+    history = load_nifty_index_history(output_dir)
+    if history.empty:
+        return None
+    history = history.sort_values("trade_date").copy()
+    close = history["close"]
+    history["sma50"] = close.rolling(50, min_periods=20).mean()
+    history["sma200"] = close.rolling(200, min_periods=60).mean()
+    history["return63d"] = close.pct_change(63)
+    history["rsi14"] = relative_strength_index(close, 14)
+    latest = history.dropna(subset=["close"]).iloc[-1]
+    close_value = float(latest["close"])
+    sma50 = float(latest["sma50"]) if pd.notna(latest["sma50"]) else np.nan
+    sma200 = float(latest["sma200"]) if pd.notna(latest["sma200"]) else np.nan
+    return63d = float(latest["return63d"]) if pd.notna(latest["return63d"]) else np.nan
+    rsi14 = float(latest["rsi14"]) if pd.notna(latest["rsi14"]) else np.nan
+    if np.isfinite(sma50) and np.isfinite(sma200) and np.isfinite(return63d) and close_value > sma200 and sma50 > sma200 and return63d > 0.03:
+        regime = "bull"
+        label = "Bull Market"
+    elif np.isfinite(sma50) and np.isfinite(sma200) and np.isfinite(return63d) and close_value < sma200 and sma50 < sma200 and return63d < -0.03:
+        regime = "bear"
+        label = "Bear Market"
+    else:
+        regime = "rangebound"
+        label = "Range-bound Market"
+
+    return {
+        "source": "Official NSE index close archive",
+        "regime": {
+            "key": regime,
+            "label": label,
+            "asOf": latest["trade_date"].strftime("%Y-%m-%d"),
+            "close": json_clean(close_value),
+            "sma50": json_clean(sma50),
+            "sma200": json_clean(sma200),
+            "return63d": json_clean(return63d),
+            "rsi14": json_clean(rsi14),
+        },
+        "series": {
+            "dates": history["trade_date"].dt.strftime("%Y-%m-%d").tolist(),
+            "close": [json_clean(value) for value in history["close"]],
+            "sma50": [json_clean(value) for value in history["sma50"]],
+            "sma200": [json_clean(value) for value in history["sma200"]],
+            "return63d": [json_clean(value) for value in history["return63d"]],
+            "rsi14": [json_clean(value) for value in history["rsi14"]],
+        },
+    }
+
+
+def add_benchmark_columns(
+    backtest: pd.DataFrame,
+    prices: pd.DataFrame,
+    initial_capital: float,
+    output_dir: Path = Path("data_cache/nse_equity"),
+) -> pd.DataFrame:
+    if backtest.empty:
+        return backtest
+    index_history = load_nifty_index_history(output_dir)
+    if not index_history.empty:
+        index_frame = index_history[["trade_date", "close"]].rename(columns={"trade_date": "date", "close": "benchmark_close"})
+        index_frame["date"] = pd.to_datetime(index_frame["date"], errors="coerce")
+        index_frame = index_frame.dropna(subset=["date"]).sort_values("date")
+        returns = index_frame["benchmark_close"].pct_change(fill_method=None).fillna(0.0)
+        benchmark = pd.DataFrame(
+            {
+                "date": index_frame["date"].dt.strftime("%Y-%m-%d"),
+                "benchmark_daily_return": returns.to_numpy(),
+                "benchmark_cumulative_return": (1 + returns).cumprod().to_numpy() - 1,
+                "benchmark_source": "official_nse_nifty50_index",
+            }
+        )
+        benchmark["benchmark_value"] = initial_capital * (1 + benchmark["benchmark_cumulative_return"])
+        out = backtest.merge(benchmark, on="date", how="left")
+        if out["benchmark_daily_return"].notna().any():
+            return out
+
     pivot = prices.pivot_table(index="score_date", columns="symbol", values="close", aggfunc="last").sort_index()
     benchmark_return = pivot.pct_change(fill_method=None).mean(axis=1, skipna=True).fillna(0.0)
     benchmark = pd.DataFrame(
@@ -1301,6 +3008,7 @@ def add_benchmark_columns(backtest: pd.DataFrame, prices: pd.DataFrame, initial_
             "date": benchmark_return.index.strftime("%Y-%m-%d"),
             "benchmark_daily_return": benchmark_return.to_numpy(),
             "benchmark_cumulative_return": (1 + benchmark_return).cumprod().to_numpy() - 1,
+            "benchmark_source": "equal_weight_nifty50_proxy",
         }
     )
     benchmark["benchmark_value"] = initial_capital * (1 + benchmark["benchmark_cumulative_return"])
@@ -1335,6 +3043,78 @@ def optimize_mvo_weights(history: pd.DataFrame, min_weight: float = 0.02, max_we
         return x0
     weights = np.clip(result.x, min_weight, max_weight)
     return weights / weights.sum()
+
+
+def optimize_score_weights(
+    history: pd.DataFrame,
+    scores: pd.Series,
+    min_weight: float = 0.02,
+    max_weight: float = 0.25,
+    risk_aversion: float = 0.55,
+) -> np.ndarray:
+    symbols = list(scores.index)
+    n = len(symbols)
+    if n == 0:
+        return np.array([])
+    clean_scores = pd.to_numeric(scores, errors="coerce").fillna(scores.median() if scores.notna().any() else 50)
+    score_alpha = ((clean_scores - clean_scores.min()) / max(clean_scores.max() - clean_scores.min(), 1e-9)).to_numpy()
+    if history is None or history.empty or history.shape[0] < 20:
+        base = np.maximum(score_alpha, 0.05)
+        return base / base.sum()
+
+    hist = history[symbols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    mu = hist.mean().to_numpy() * 252
+    vol = hist.std(ddof=1).replace(0, np.nan).fillna(hist.stack().std() or 0.01).to_numpy() * np.sqrt(252)
+    cov = np.nan_to_num(hist.cov().to_numpy() * 252, nan=0.0, posinf=0.0, neginf=0.0) + np.eye(n) * 1e-6
+    alpha = 0.55 * score_alpha + 0.30 * ((mu - np.nanmin(mu)) / max(np.nanmax(mu) - np.nanmin(mu), 1e-9)) + 0.15 * (1 - ((vol - np.nanmin(vol)) / max(np.nanmax(vol) - np.nanmin(vol), 1e-9)))
+
+    def objective(weights: np.ndarray) -> float:
+        expected = float(np.dot(weights, alpha))
+        risk = float(np.sqrt(max(np.dot(weights, np.dot(cov, weights)), 1e-12)))
+        concentration = float(np.sum(weights ** 2))
+        return -(expected - risk_aversion * risk - 0.05 * concentration)
+
+    x0 = np.maximum(score_alpha, 0.05)
+    x0 = x0 / x0.sum()
+    result = minimize(
+        objective,
+        x0,
+        method="SLSQP",
+        bounds=[(min_weight, max_weight)] * n,
+        constraints=[{"type": "eq", "fun": lambda weights: np.sum(weights) - 1}],
+        options={"maxiter": 500, "ftol": 1e-10},
+    )
+    if not result.success or not np.all(np.isfinite(result.x)):
+        return x0
+    weights = np.clip(result.x, min_weight, max_weight)
+    return weights / weights.sum()
+
+
+def add_market_regime(data: pd.DataFrame) -> pd.DataFrame:
+    pivot = data.pivot_table(index="score_date", columns="symbol", values="close", aggfunc="last").sort_index()
+    benchmark_return = pivot.pct_change(fill_method=None).mean(axis=1, skipna=True).fillna(0.0)
+    benchmark_cumulative_63d = (1 + benchmark_return).rolling(63, min_periods=20).apply(np.prod, raw=True) - 1
+    benchmark_vol_21d = benchmark_return.rolling(21, min_periods=10).std() * np.sqrt(252)
+    regime = pd.Series("rangebound", index=benchmark_return.index)
+    regime[benchmark_cumulative_63d > 0.05] = "bull"
+    regime[benchmark_cumulative_63d < -0.05] = "bear"
+    regime[(benchmark_cumulative_63d.abs() <= 0.05) | benchmark_cumulative_63d.isna()] = "rangebound"
+    out = data.merge(
+        pd.DataFrame(
+            {
+                "score_date": regime.index,
+                "market_regime": regime.values,
+                "benchmark_63d_return": benchmark_cumulative_63d.values,
+                "benchmark_21d_volatility": benchmark_vol_21d.values,
+            }
+        ),
+        on="score_date",
+        how="left",
+    )
+    out = out.sort_values(["symbol", "score_date"])
+    out["symbol_volatility_63d"] = out.groupby("symbol")["symbol_return"].transform(lambda s: s.rolling(63, min_periods=20).std() * np.sqrt(252))
+    out["symbol_return_63d"] = out.groupby("symbol")["close"].transform(lambda s: s.pct_change(63))
+    return out
 
 
 def build_rebalance_holdings(
@@ -1394,13 +3174,12 @@ def generate_strategy_backtests(
     transaction_cost: float = 0.0001,
     holding_days: int = 30,
     top_n: int = 10,
-    mvo_lookback: int = 126,
 ) -> BacktestResult:
     backtest_dir = output_dir / "backtests"
     backtest_dir.mkdir(parents=True, exist_ok=True)
-    fundamental_path = latest_required_csv(
+    fundamental_path = latest_required_csv_any(
         output_dir / "fundamentals" / "fundamental_scores_history",
-        "nse_fundamental_scores_history_*.csv",
+        ["nse_fundamental_scores_history_*.csv", "screener_fundamental_scores_history_*.csv"],
         "fundamental score history",
     )
     technical_path = latest_required_csv(
@@ -1408,14 +3187,62 @@ def generate_strategy_backtests(
         "nse_technical_scores_history_*.csv",
         "technical score history",
     )
-    fundamental = pd.read_csv(fundamental_path, usecols=["score_date", "symbol", "fundamental_score"])
-    technical = pd.read_csv(technical_path, usecols=["score_date", "symbol", "technical_score", "close"])
+    fundamental = pd.read_csv(fundamental_path)
+    technical = pd.read_csv(technical_path)
+    technical_keep = [
+        "score_date",
+        "symbol",
+        "technical_score",
+        "value_score_0_50",
+        "momentum_score_0_50",
+        "return_21d_pct",
+        "return_63d_pct",
+        "return_126d_pct",
+        "sma50_over_sma200_pct",
+        "discount_to_252d_high_pct",
+        "discount_to_sma200_pct",
+        "bollinger_pct_b",
+        "rsi_14",
+        "close",
+    ]
+    technical = technical[[col for col in technical_keep if col in technical.columns]]
+    fundamental_keep = [
+        "score_date",
+        "symbol",
+        "fundamental_score",
+        "growth_score",
+        "profitability_score",
+        "efficiency_score",
+        "shareholding_quality_score",
+        "freshness_score",
+    ]
+    fundamental = fundamental[[col for col in fundamental_keep if col in fundamental.columns]]
     for frame in (fundamental, technical):
         frame["score_date"] = pd.to_datetime(frame["score_date"])
         frame["symbol"] = frame["symbol"].astype(str).str.upper()
     data = technical.merge(fundamental, on=["score_date", "symbol"], how="inner")
-    for column in ["fundamental_score", "technical_score", "close"]:
-        data[column] = pd.to_numeric(data[column], errors="coerce")
+    for column in [
+        "fundamental_score",
+        "technical_score",
+        "value_score_0_50",
+        "momentum_score_0_50",
+        "return_21d_pct",
+        "return_63d_pct",
+        "return_126d_pct",
+        "sma50_over_sma200_pct",
+        "discount_to_252d_high_pct",
+        "discount_to_sma200_pct",
+        "bollinger_pct_b",
+        "rsi_14",
+        "growth_score",
+        "profitability_score",
+        "efficiency_score",
+        "shareholding_quality_score",
+        "freshness_score",
+        "close",
+    ]:
+        if column in data.columns:
+            data[column] = pd.to_numeric(data[column], errors="coerce")
     data["average_score"] = data[["fundamental_score", "technical_score"]].mean(axis=1)
     data = data.sort_values(["symbol", "score_date"])
     data["symbol_return"] = data.groupby("symbol")["close"].pct_change().fillna(0.0)
@@ -1471,7 +3298,7 @@ def generate_strategy_backtests(
                     "portfolio_value": equity,
                 }
             )
-        backtest = add_benchmark_columns(pd.DataFrame(rows), data, initial_capital)
+        backtest = add_benchmark_columns(pd.DataFrame(rows), data, initial_capital, output_dir=output_dir)
         backtest_path = backtest_dir / f"{strategy}_top10_score_weighted_backtest.csv"
         backtest.to_csv(backtest_path, index=False)
         backtest_paths.append(backtest_path)
@@ -1492,80 +3319,6 @@ def generate_strategy_backtests(
                 }
             )
         holdings_paths.append(build_rebalance_holdings(strategy, blocks, data, backtest, backtest_dir))
-
-    prices = data.pivot_table(index="score_date", columns="symbol", values="close", aggfunc="last").sort_index()
-    returns = prices.pct_change(fill_method=None).fillna(0.0)
-    average_scores = data.pivot_table(index="score_date", columns="symbol", values="average_score", aggfunc="last").sort_index()
-    dates = list(prices.index)
-    rebalance_dates = dates[::holding_days]
-    equity = initial_capital
-    previous_weights = {symbol: 0.0 for symbol in prices.columns}
-    rows = []
-    blocks = []
-    last_top_symbols: list[str] = []
-    for block_number, start_dt in enumerate(rebalance_dates, start=1):
-        start_idx = dates.index(start_dt)
-        end_dt = dates[min(start_idx + holding_days - 1, len(dates) - 1)]
-        if start_idx < 20:
-            top_symbols = average_scores.loc[start_dt].dropna().sort_values(ascending=False).head(top_n).index.tolist()
-            history = None
-        else:
-            history = returns.iloc[max(0, start_idx - mvo_lookback):start_idx]
-            sharpe = (history.mean() * 252) / (history.std(ddof=1) * np.sqrt(252)).replace(0, np.nan)
-            top_symbols = sharpe.replace([np.inf, -np.inf], np.nan).dropna().sort_values(ascending=False).head(top_n).index.tolist()
-            if len(top_symbols) < top_n:
-                top_symbols = average_scores.loc[start_dt].dropna().sort_values(ascending=False).head(top_n).index.tolist()
-                history = None
-        weights = optimize_mvo_weights(history[top_symbols]) if history is not None else np.repeat(1 / len(top_symbols), len(top_symbols))
-        current_weights = {symbol: 0.0 for symbol in prices.columns}
-        for symbol, weight in zip(top_symbols, weights):
-            current_weights[symbol] = float(weight)
-        turnover = sum(abs(current_weights[symbol] - previous_weights.get(symbol, 0.0)) for symbol in prices.columns)
-        blocks.append(
-            {
-                "start_date": pd.Timestamp(start_dt).strftime("%Y-%m-%d"),
-                "end_date": pd.Timestamp(end_dt).strftime("%Y-%m-%d"),
-                "holdings": [
-                    {
-                        "symbol": symbol,
-                        "score": float(average_scores.loc[start_dt, symbol]) if pd.notna(average_scores.loc[start_dt, symbol]) else np.nan,
-                        "weight": current_weights[symbol],
-                    }
-                    for symbol in top_symbols
-                ],
-            }
-        )
-        for day_offset, score_date in enumerate(dates[start_idx:dates.index(end_dt) + 1]):
-            daily_return = sum(current_weights[symbol] * float(returns.loc[score_date, symbol]) for symbol in top_symbols)
-            if day_offset == 0:
-                daily_return -= transaction_cost * turnover
-            equity *= 1 + daily_return
-            rows.append(
-                {
-                    "date": pd.Timestamp(score_date).strftime("%Y-%m-%d"),
-                    "daily_return": daily_return,
-                    "cumulative_return": equity / initial_capital - 1,
-                    "portfolio_value": equity,
-                }
-            )
-        previous_weights = current_weights
-        last_top_symbols = top_symbols
-    mvo_backtest = add_benchmark_columns(pd.DataFrame(rows).drop_duplicates("date", keep="last"), data, initial_capital)
-    mvo_backtest_path = backtest_dir / "mvo_top10_score_weighted_backtest.csv"
-    mvo_backtest.to_csv(mvo_backtest_path, index=False)
-    backtest_paths.append(mvo_backtest_path)
-    holdings_paths.append(build_rebalance_holdings("mvo", blocks, data, mvo_backtest, backtest_dir))
-
-    mvo_symbol_metrics = []
-    for symbol in returns.columns:
-        metrics = backtest_metrics(returns[symbol])
-        metrics.update({"symbol": symbol, "score_type": "mvo"})
-        mvo_symbol_metrics.append(metrics)
-    mvo_symbol_metrics_df = pd.DataFrame(mvo_symbol_metrics).sort_values("sharpe", ascending=False)
-    mvo_metrics_path = backtest_dir / "mvo_score_weighted_symbol_metrics.csv"
-    mvo_symbol_metrics_df.to_csv(mvo_metrics_path, index=False)
-    symbol_metrics_paths.append(mvo_metrics_path)
-    selected_metrics_frames.append(mvo_symbol_metrics_df[mvo_symbol_metrics_df["symbol"].isin(last_top_symbols)].head(top_n))
 
     selected_metrics_path = backtest_dir / "selected_top10_score_weighted_symbol_metrics.csv"
     pd.concat(selected_metrics_frames, ignore_index=True, sort=False).to_csv(selected_metrics_path, index=False)
@@ -1607,9 +3360,9 @@ def display_label(column: str) -> str:
 
 
 def latest_score_histories(output_dir: Path) -> tuple[Path, Path]:
-    fundamental_path = latest_required_csv(
+    fundamental_path = latest_required_csv_any(
         output_dir / "fundamentals" / "fundamental_scores_history",
-        "nse_fundamental_scores_history_*.csv",
+        ["nse_fundamental_scores_history_*.csv", "screener_fundamental_scores_history_*.csv"],
         "fundamental score history",
     )
     technical_path = latest_required_csv(
@@ -1707,6 +3460,7 @@ def build_dashboard_data(output_dir: Path) -> dict:
         ],
         "fundamentalVariables": fundamental_variables,
         "technicalVariables": technical_variables,
+        "niftyIndex": nifty_index_dashboard_payload(output_dir),
         "symbols": symbols,
     }
 
@@ -1753,12 +3507,12 @@ def build_backtest_dashboard_data(output_dir: Path) -> dict:
         "fundamental": "Fundamental",
         "technical": "Technical",
         "average": "Average Score",
-        "mvo": "Mean Variance",
     }
     selected_path = backtest_dir / "selected_top10_score_weighted_symbol_metrics.csv"
     selected = pd.read_csv(selected_path) if selected_path.exists() else pd.DataFrame()
     payload: dict[str, dict] = {}
     benchmark_series = None
+    benchmark_source = None
     for strategy, label in strategy_labels.items():
         backtest_path = backtest_dir / f"{strategy}_top10_score_weighted_backtest.csv"
         if not backtest_path.exists():
@@ -1771,6 +3525,8 @@ def build_backtest_dashboard_data(output_dir: Path) -> dict:
                 "cumulativeReturn": [json_clean(value) for value in backtest["benchmark_cumulative_return"]],
                 "portfolioValue": [json_clean(value) for value in backtest["benchmark_value"]],
             }
+            if "benchmark_source" in backtest and backtest["benchmark_source"].notna().any():
+                benchmark_source = str(backtest["benchmark_source"].dropna().iloc[-1])
         strategy_selected = selected[selected.get("score_type", pd.Series(dtype=str)).eq(strategy)].copy()
         if not strategy_selected.empty and "sharpe" in strategy_selected:
             top_symbols = strategy_selected.sort_values("sharpe", ascending=False)["symbol"].astype(str).tolist()
@@ -1789,8 +3545,14 @@ def build_backtest_dashboard_data(output_dir: Path) -> dict:
             "holdings": holdings_blocks_from_csv(backtest_dir / f"{strategy}_top10_score_weighted_holdings.csv"),
         }
     if benchmark_series is not None:
+        benchmark_label = (
+            "Official NIFTY 50 Index"
+            if benchmark_source == "official_nse_nifty50_index"
+            else "Equal-weight NIFTY 50 proxy"
+        )
         payload["benchmark"] = {
-            "label": "Equal-weight NIFTY 50 proxy",
+            "label": benchmark_label,
+            "source": benchmark_source,
             "series": benchmark_series,
             "metrics": {key: json_clean(value) for key, value in backtest_metrics(pd.Series(benchmark_series["dailyReturn"])).items()},
         }
@@ -1925,6 +3687,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pull the latest available NSE close on or before yesterday",
     )
     parser.add_argument(
+        "--index-history",
+        action="store_true",
+        help="Also download NIFTY 50 index close history from NSE archives",
+    )
+    parser.add_argument(
+        "--index-history-only",
+        action="store_true",
+        help="Download only NIFTY 50 index close history from NSE archives",
+    )
+    parser.add_argument(
         "--fallback-days",
         type=int,
         default=10,
@@ -1933,18 +3705,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fundamentals",
         action="store_true",
-        help="Also download NSE Financial Results and Shareholding Pattern CSVs",
+        help="Also download fundamental filings from the selected source",
     )
     parser.add_argument(
         "--fundamentals-only",
         action="store_true",
-        help="Download only NSE Financial Results and Shareholding Pattern CSVs",
+        help="Download only fundamental filings from the selected source",
     )
     parser.add_argument(
         "--fundamentals-years",
         type=int,
         default=8,
         help="Financial Results lookback window in years for quarterly and annual filings",
+    )
+    parser.add_argument(
+        "--fundamentals-source",
+        choices=["auto", "screener", "moneycontrol", "economictimes", "cached"],
+        default="auto",
+        help="Fundamental data source: auto tries Screener, Moneycontrol, Economic Times, then cached files",
     )
     parser.add_argument(
         "--fundamental-scores",
@@ -1996,6 +3774,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    explicit_fundamentals_only = args.fundamentals_only
     default_end = date.today() - timedelta(days=1)
     default_start = default_end - timedelta(days=30)
     if args.previous_close:
@@ -2015,6 +3794,9 @@ def main() -> None:
     if args.technical_score_history_only:
         args.fundamentals_only = True
         args.technical_score_history = True
+    if args.index_history_only:
+        args.fundamentals_only = True
+        args.index_history = True
     if (
         args.backtests
         or args.dashboard_html
@@ -2049,6 +3831,17 @@ def main() -> None:
     ):
         args.fundamentals_only = True
 
+    if args.index_history and (args.start is None or args.end is None):
+        if args.previous_close:
+            args.end = default_end
+            args.start = args.end - timedelta(days=max(args.fallback_days, 0))
+        elif args.last_year:
+            args.end = args.end or default_end
+            args.start = args.end - timedelta(days=365)
+        elif args.index_history_only:
+            args.end = args.end or default_end
+            args.start = args.start or (args.end - timedelta(days=365))
+
     if not args.fundamentals_only:
         args.start = args.start or default_start
         args.end = args.end or default_end
@@ -2074,16 +3867,34 @@ def main() -> None:
             print(f"Constituents: {len(result.constituents)} rows -> {result.constituents_path}")
             print(f"Prices: {len(result.prices)} rows -> {result.prices_path}")
 
+    if args.index_history:
+        args.start = args.start or default_start
+        args.end = args.end or default_end
+        index_result = pull_nifty_index_history(
+            start=args.start,
+            end=args.end,
+            output_dir=args.output_dir,
+            daily_files=True,
+            latest_available_only=args.previous_close and not args.last_year,
+            fallback_days=max(args.fallback_days, 0),
+        )
+        print(f"NIFTY index files: {len(index_result.index_paths)}")
+        print(f"NIFTY index rows: {len(index_result.index_history)} -> {index_result.history_path}")
+
     fundamentals = None
     needs_fundamentals = (
         args.fundamentals
+        or explicit_fundamentals_only
         or args.fundamental_scores
         or args.fundamental_score_history
         or args.scores_only
         or args.score_history_only
     )
-    use_cached_fundamentals = args.score_history_only and not args.fundamentals
-    if use_cached_fundamentals:
+    use_cached_fundamentals = (
+        args.fundamentals_source == "cached"
+        or (args.score_history_only and not args.fundamentals)
+    )
+    if needs_fundamentals and use_cached_fundamentals:
         fundamentals = load_latest_cached_fundamentals(args.output_dir)
         print(
             f"Cached financial results: {len(fundamentals.financial_results)} rows -> "
@@ -2098,41 +3909,143 @@ def main() -> None:
             f"{fundamentals.shareholding_path}"
         )
     elif needs_fundamentals:
-        try:
-            fundamentals = download_nse_fundamentals(
+        if args.fundamentals_source == "screener":
+            fundamentals = download_screener_fundamentals(
                 output_dir=args.output_dir,
                 symbols=args.symbols,
                 limit=args.limit,
                 lookback_years=max(args.fundamentals_years, 1),
             )
             print(
-                f"Financial results: {len(fundamentals.financial_results)} rows -> "
+                f"Screener financial results: {len(fundamentals.financial_results)} rows -> "
                 f"{fundamentals.financial_results_path}"
             )
             print(
-                f"Financial result announcements: {len(fundamentals.financial_announcements)} rows -> "
+                f"Screener financial result metadata: {len(fundamentals.financial_announcements)} rows -> "
                 f"{fundamentals.financial_announcements_path}"
             )
             print(
-                f"Shareholding pattern: {len(fundamentals.shareholding)} rows -> "
+                f"Screener shareholding pattern: {len(fundamentals.shareholding)} rows -> "
                 f"{fundamentals.shareholding_path}"
             )
-        except Exception as exc:
-            print(f"Live NSE fundamentals download failed: {exc}")
-            print("Falling back to latest cached fundamentals.")
-            fundamentals = load_latest_cached_fundamentals(args.output_dir)
+        elif args.fundamentals_source == "moneycontrol":
+            fundamentals = download_moneycontrol_fundamentals(
+                output_dir=args.output_dir,
+                symbols=args.symbols,
+                limit=args.limit,
+                lookback_years=max(args.fundamentals_years, 1),
+            )
             print(
-                f"Cached financial results: {len(fundamentals.financial_results)} rows -> "
+                f"Moneycontrol financial results: {len(fundamentals.financial_results)} rows -> "
                 f"{fundamentals.financial_results_path}"
             )
             print(
-                f"Cached financial result announcements: {len(fundamentals.financial_announcements)} rows -> "
+                f"Moneycontrol financial result metadata: {len(fundamentals.financial_announcements)} rows -> "
                 f"{fundamentals.financial_announcements_path}"
             )
             print(
-                f"Cached shareholding pattern: {len(fundamentals.shareholding)} rows -> "
+                f"Moneycontrol shareholding placeholder: {len(fundamentals.shareholding)} rows -> "
                 f"{fundamentals.shareholding_path}"
             )
+        elif args.fundamentals_source == "economictimes":
+            fundamentals = download_economic_times_fundamentals(
+                output_dir=args.output_dir,
+                symbols=args.symbols,
+                limit=args.limit,
+                lookback_years=max(args.fundamentals_years, 1),
+            )
+            print(
+                f"Economic Times financial results: {len(fundamentals.financial_results)} rows -> "
+                f"{fundamentals.financial_results_path}"
+            )
+            print(
+                f"Economic Times financial result metadata: {len(fundamentals.financial_announcements)} rows -> "
+                f"{fundamentals.financial_announcements_path}"
+            )
+            print(
+                f"Economic Times shareholding placeholder: {len(fundamentals.shareholding)} rows -> "
+                f"{fundamentals.shareholding_path}"
+            )
+        else:
+            try:
+                fundamentals = download_screener_fundamentals(
+                    output_dir=args.output_dir,
+                    symbols=args.symbols,
+                    limit=args.limit,
+                    lookback_years=max(args.fundamentals_years, 1),
+                )
+                print(
+                    f"Screener financial results: {len(fundamentals.financial_results)} rows -> "
+                    f"{fundamentals.financial_results_path}"
+                )
+                print(
+                    f"Screener financial result metadata: {len(fundamentals.financial_announcements)} rows -> "
+                    f"{fundamentals.financial_announcements_path}"
+                )
+                print(
+                    f"Screener shareholding pattern: {len(fundamentals.shareholding)} rows -> "
+                    f"{fundamentals.shareholding_path}"
+                )
+            except Exception as exc:
+                print(f"Screener fundamentals download failed: {exc}")
+                print("Trying Moneycontrol fundamentals.")
+                try:
+                    fundamentals = download_moneycontrol_fundamentals(
+                        output_dir=args.output_dir,
+                        symbols=args.symbols,
+                        limit=args.limit,
+                        lookback_years=max(args.fundamentals_years, 1),
+                    )
+                    print(
+                        f"Moneycontrol financial results: {len(fundamentals.financial_results)} rows -> "
+                        f"{fundamentals.financial_results_path}"
+                    )
+                    print(
+                        f"Moneycontrol financial result metadata: {len(fundamentals.financial_announcements)} rows -> "
+                        f"{fundamentals.financial_announcements_path}"
+                    )
+                    print(
+                        f"Moneycontrol shareholding placeholder: {len(fundamentals.shareholding)} rows -> "
+                        f"{fundamentals.shareholding_path}"
+                    )
+                except Exception as mc_exc:
+                    print(f"Moneycontrol fundamentals download failed: {mc_exc}")
+                    print("Trying Economic Times fundamentals.")
+                    try:
+                        fundamentals = download_economic_times_fundamentals(
+                            output_dir=args.output_dir,
+                            symbols=args.symbols,
+                            limit=args.limit,
+                            lookback_years=max(args.fundamentals_years, 1),
+                        )
+                        print(
+                            f"Economic Times financial results: {len(fundamentals.financial_results)} rows -> "
+                            f"{fundamentals.financial_results_path}"
+                        )
+                        print(
+                            f"Economic Times financial result metadata: {len(fundamentals.financial_announcements)} rows -> "
+                            f"{fundamentals.financial_announcements_path}"
+                        )
+                        print(
+                            f"Economic Times shareholding placeholder: {len(fundamentals.shareholding)} rows -> "
+                            f"{fundamentals.shareholding_path}"
+                        )
+                    except Exception as et_exc:
+                        print(f"Economic Times fundamentals download failed: {et_exc}")
+                        print("Falling back to latest cached fundamentals.")
+                        fundamentals = load_latest_cached_fundamentals(args.output_dir)
+                        print(
+                            f"Cached financial results: {len(fundamentals.financial_results)} rows -> "
+                            f"{fundamentals.financial_results_path}"
+                        )
+                        print(
+                            f"Cached financial result announcements: {len(fundamentals.financial_announcements)} rows -> "
+                            f"{fundamentals.financial_announcements_path}"
+                        )
+                        print(
+                            f"Cached shareholding pattern: {len(fundamentals.shareholding)} rows -> "
+                            f"{fundamentals.shareholding_path}"
+                        )
 
     if args.fundamental_scores:
         if fundamentals is None:

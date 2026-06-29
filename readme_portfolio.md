@@ -8,6 +8,7 @@ and `nse_nifty_pull.py`.
 The current workflow pulls NIFTY 50 stock data from official NSE archive sources:
 
 - NIFTY 50 constituents from the NSE index constituent CSV.
+- Official NIFTY 50 index closes from the NSE index close archive.
 - Daily cash-market bhavcopy files from NSE archive zip files.
 - Cleaned OHLCV-style rows for selected NIFTY 50 `EQ` symbols.
 - NSE Financial Results corporate filing records.
@@ -17,7 +18,7 @@ The current workflow pulls NIFTY 50 stock data from official NSE archive sources
 - Daily NIFTY technical score records using conventional value/mean-reversion
   and momentum indicators computed from cached OHLCV price history.
 - Daily strategy backtests and rebalance holdings for Fundamental, Technical,
-  Average Score, and Mean Variance strategies.
+  and Average Score strategies.
 
 The output is suitable for downstream portfolio analysis, volatility research, and
 backtesting pipelines.
@@ -31,6 +32,7 @@ backtesting pipelines.
 - `nse_nifty_pull.py`
   - Contains the NSE archive client.
   - Pulls NIFTY 50 constituents.
+  - Pulls official NIFTY 50 index close history for benchmark and regime checks.
   - Downloads and caches daily cash-market bhavcopy files.
   - Filters bhavcopy rows to NIFTY 50 equity symbols.
   - Downloads NSE Financial Results and Shareholding Pattern records.
@@ -97,6 +99,14 @@ last one year:
 python3 portfolioAnalysis_SM.py --last-year --daily-files
 ```
 
+Seed or refresh the official NIFTY 50 index close history used by the dashboard
+regime panel and benchmark overlay:
+
+```bash
+python3 portfolioAnalysis_SM.py --index-history-only --last-year
+python3 portfolioAnalysis_SM.py --index-history-only --from 2025-06-02 --to 2026-06-25
+```
+
 Run on a subsequent day to pull the latest available previous close. This skips
 weekends and holidays by looking back up to 10 calendar days:
 
@@ -110,7 +120,7 @@ Increase the holiday/weekend lookback window if needed:
 python3 portfolioAnalysis_SM.py --previous-close --fallback-days 20
 ```
 
-Download only NSE fundamentals for the current NIFTY 50 list:
+Download only fundamentals for the current NIFTY 50 list:
 
 ```bash
 python3 portfolioAnalysis_SM.py --fundamentals-only
@@ -128,6 +138,23 @@ Download previous-close price files and fundamentals in one run:
 ```bash
 python3 portfolioAnalysis_SM.py --previous-close --fundamentals
 ```
+
+Choose the fundamentals source workflow:
+
+```bash
+python3 portfolioAnalysis_SM.py --fundamentals --fundamentals-source auto
+python3 portfolioAnalysis_SM.py --fundamentals --fundamentals-source screener
+python3 portfolioAnalysis_SM.py --fundamentals --fundamentals-source moneycontrol
+python3 portfolioAnalysis_SM.py --fundamentals --fundamentals-source economictimes
+python3 portfolioAnalysis_SM.py --fundamentals --fundamentals-source cached
+```
+
+`auto` tries Screener fundamentals first, then Moneycontrol, then Economic
+Times, and finally the latest cached fundamentals if live sources block the
+runner. `screener` builds normalized quarterly, annual, and shareholding input
+files from Screener tables. `moneycontrol` and `economictimes` remain fallback
+financial-table sources. `cached` skips live fundamentals and uses the latest
+cached provider files.
 
 Generate daily fundamental scores after downloading fundamentals:
 
@@ -164,7 +191,7 @@ Daily end-to-end run, including latest price/fundamental refresh, score refresh,
 strategy backtests, holdings, and standalone dashboard HTML:
 
 ```bash
-python3 portfolioAnalysis_SM.py --previous-close --fallback-days 14 --fundamentals --fundamental-scores --technical-scores --backtests --dashboard-html
+python3 portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --technical-scores --backtests --dashboard-html
 ```
 
 Generate only the latest and datestamped dashboard HTML from cached histories and
@@ -180,15 +207,16 @@ The daily GitHub Actions workflow in `.github/workflows/daily-summary.yml` runs 
 Indian market weekdays after the regular NSE close. As part of that run, it calls:
 
 ```bash
-python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --fundamentals --fundamental-scores --technical-scores --backtests --dashboard-html
+python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --technical-scores --backtests --dashboard-html
 ```
 
-This writes the latest available previous-close NIFTY 50 files into
-`data_cache/nse_equity/`, and writes NSE Financial Results and Shareholding Pattern
-CSVs into `data_cache/nse_equity/fundamentals/`. It also writes financial-result
-announcement CSVs, a daily fundamental score CSV, and technical score CSVs
-computed from the full cached price history. It then generates the strategy
-backtest and holdings CSVs under `data_cache/nse_equity/backtests/`. The workflow
+This writes the latest available previous-close NIFTY 50 files and official
+NIFTY 50 index close into `data_cache/nse_equity/`, and writes Financial Results
+and Shareholding Pattern CSVs into `data_cache/nse_equity/fundamentals/`. It also
+writes financial-result announcement CSVs, a daily fundamental score CSV, and
+technical score CSVs computed from the full cached price history. It then
+generates the strategy backtest and holdings CSVs under
+`data_cache/nse_equity/backtests/`. The workflow
 also writes `fundamental_score_dashboard.html` and a datestamped dashboard under
 `dashboards/`. It then commits generated report files, NSE data files, and
 dashboard files back to the repository when anything changed.
@@ -225,21 +253,41 @@ When `--daily-files` is used, generated files also include:
 - `constituents_by_day/nifty50_constituents_YYYYMMDD.csv`
   - One constituent file per available trading day.
 
+When `--index-history` or `--index-history-only` is used, generated files include:
+
+- `index_by_day/nifty50_index_YYYYMMDD.csv`
+  - One official NIFTY 50 index close row per available trading day.
+
+- `index_history/nifty50_index_history_STARTDATE_ENDDATE.csv`
+  - Combined official NIFTY 50 index history used for dashboard regime
+    classification and benchmark overlays.
+
 When `--fundamentals` or `--fundamentals-only` is used, generated files include:
 
-- `fundamentals/financial_results_by_day/nse_financial_results_YYYYMMDD.csv`
-  - NSE Financial Results records for the selected NIFTY 50 symbols.
+- `fundamentals/financial_results_by_day/screener_financial_results_YYYYMMDD.csv`
+  - Screener quarterly and annual financial table records for the selected
+    NIFTY 50 symbols.
+  - If Screener fails and a fallback succeeds, the equivalent file is
+    `moneycontrol_financial_results_YYYYMMDD.csv` or
+    `economictimes_financial_results_YYYYMMDD.csv`.
 
-- `fundamentals/financial_result_announcements_by_day/nse_financial_result_announcements_YYYYMMDD.csv`
-  - NSE announcements that mention actual financial results filings.
+- `fundamentals/financial_result_announcements_by_day/screener_financial_result_announcements_YYYYMMDD.csv`
+  - Provider metadata rows used by the fundamental score recency logic.
+  - If Screener fails and Economic Times succeeds, the equivalent file is
+    `economictimes_financial_result_announcements_YYYYMMDD.csv`.
 
-- `fundamentals/shareholding_by_day/nse_shareholding_pattern_YYYYMMDD.csv`
-  - NSE Shareholding Pattern records for the selected NIFTY 50 symbols.
+- `fundamentals/shareholding_by_day/screener_shareholding_pattern_YYYYMMDD.csv`
+  - Screener shareholding table records with promoter and public holding values
+    mapped into `pr_and_prgrp` and `public_val`.
 
-- `fundamentals/fundamental_scores_by_day/nse_fundamental_scores_YYYYMMDD.csv`
+- `fundamentals/screener_raw_by_day/screener_raw_YYYYMMDD.csv`
+  - Raw Screener fetch metadata and parse diagnostics. Moneycontrol and
+    Economic Times write equivalent files under their own raw directories.
+
+- `fundamentals/fundamental_scores_by_day/screener_fundamental_scores_YYYYMMDD.csv`
   - One fundamental score row per selected NIFTY 50 symbol.
 
-- `fundamentals/fundamental_scores_history/nse_fundamental_scores_history_STARTDATE_ENDDATE.csv`
+- `fundamentals/fundamental_scores_history/screener_fundamental_scores_history_STARTDATE_ENDDATE.csv`
   - Combined historical fundamental score file across cached business days.
 
 When `--technical-score-history` or `--technical-score-history-only` is used,
@@ -263,9 +311,6 @@ When `--backtests` is used, generated files include:
 - `backtests/average_top10_score_weighted_backtest.csv`
   - Same fields for the Average Score strategy, where strategy score is
     `(fundamental_score + technical_score) / 2`.
-
-- `backtests/mvo_top10_score_weighted_backtest.csv`
-  - Same fields for the Mean Variance strategy.
 
 - `backtests/*_top10_score_weighted_holdings.csv`
   - Rebalance holdings for each strategy, including score, weight, integer
@@ -434,25 +479,18 @@ Generated strategies:
   - Selects the 10 symbols with the highest realized score-weighted Sharpe from
     the available history.
 
-- `mvo`
-  - Rebalances every 30 business days.
-  - Ranks symbols by trailing mean-variance attractiveness using trailing
-    Sharpe.
-  - Selects the top 10 at each rebalance and optimizes long-only weights across
-    those 10 names.
-  - Weight bounds are 2% minimum and 20% maximum per selected symbol.
-  - Uses the Average Score top 10 as the first-block fallback when there is not
-    enough trailing return history.
-
 All strategy backtests start with `100000` initial capital and apply `0.01%`
-transaction cost on exposure or weight turnover. Benchmark columns are an
-equal-weight NIFTY constituent proxy built from cached constituent closes because
-the local cache does not include an official NIFTY index series.
+transaction cost on exposure or weight turnover. Benchmark columns use the
+official NSE NIFTY 50 index close history when cached, with an equal-weight
+NIFTY constituent proxy fallback if index history is unavailable.
 
 ## HTML Dashboard
 
 `fundamental_score_dashboard.html` is a standalone browser dashboard generated
 from the cached price, fundamental score, and technical score history files. It
+shows a top-level NIFTY 50 index panel using official NSE index closes, SMA50,
+SMA200, 63-trading-day return, and RSI14 to label the market as bull, bear, or
+range-bound.
 embeds the required data directly and lets you choose:
 
 - NIFTY symbol
@@ -528,6 +566,12 @@ Technical score history smoke test:
 python3 portfolioAnalysis_SM.py --technical-score-history-only --symbols RELIANCE TCS
 ```
 
+NIFTY 50 index history smoke test:
+
+```bash
+python3 portfolioAnalysis_SM.py --index-history-only --previous-close --fallback-days 14
+```
+
 Backtest generation smoke test from cached score histories:
 
 ```bash
@@ -552,8 +596,10 @@ Expected result:
   one financial-result announcements CSV, and one Fundamental Score CSV.
 - With `--technical-score-history-only`, one technical score CSV per cached
   business day and one combined technical score history CSV.
-- With `--backtests`, four strategy backtest CSVs, four strategy holdings CSVs,
-  four per-strategy symbol metrics CSVs, and one combined selected top-10 metrics
+- With `--index-history-only`, one official NIFTY 50 index CSV per available
+  trading day and one combined index history CSV.
+- With `--backtests`, three strategy backtest CSVs, three strategy holdings CSVs,
+  three per-strategy symbol metrics CSVs, and one combined selected top-10 metrics
   CSV under `data_cache/nse_equity/backtests/`.
 - With `--dashboard-html`, the latest standalone HTML dashboard and one
   datestamped copy under `dashboards/`.
