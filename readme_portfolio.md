@@ -191,7 +191,7 @@ Daily end-to-end run, including latest price/fundamental refresh, score refresh,
 strategy backtests, holdings, and standalone dashboard HTML:
 
 ```bash
-python3 portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --technical-scores --backtests --dashboard-html
+python3 portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
 ```
 
 Generate only the latest and datestamped dashboard HTML from cached histories and
@@ -207,7 +207,7 @@ The daily GitHub Actions workflow in `.github/workflows/daily-summary.yml` runs 
 Indian market weekdays after the regular NSE close. As part of that run, it calls:
 
 ```bash
-python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --technical-scores --backtests --dashboard-html
+python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
 ```
 
 This writes the latest available previous-close NIFTY 50 files and official

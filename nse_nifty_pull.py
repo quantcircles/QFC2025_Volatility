@@ -2620,9 +2620,34 @@ def generate_fundamental_score_history(
             raise RuntimeError("No price-by-day files found and no explicit score history date range supplied.")
         score_dates = list(iter_dates(start, end))
 
+    history_dir = output_dir / "fundamentals" / "fundamental_scores_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    wanted_date_values = {score_date.isoformat() for score_date in score_dates}
+    existing_by_date: dict[str, pd.DataFrame] = {}
+    for path in sorted(history_dir.glob("*fundamental_scores_history_*.csv")):
+        existing = pd.read_csv(path)
+        if existing.empty or "score_date" not in existing.columns:
+            continue
+        existing["score_date"] = parse_date_series(existing["score_date"]).dt.strftime("%Y-%m-%d")
+        existing = existing[existing["score_date"].isin(wanted_date_values)].copy()
+        for score_date, day_scores in existing.groupby("score_date", sort=False):
+            existing_by_date[score_date] = day_scores.copy()
+
     all_scores = []
     score_paths = []
     for score_date in score_dates:
+        score_date_value = score_date.isoformat()
+        if score_date_value in existing_by_date:
+            all_scores.append(existing_by_date[score_date_value])
+            existing_score_path = (
+                output_dir
+                / "fundamentals"
+                / "fundamental_scores_by_day"
+                / f"screener_fundamental_scores_{score_date.strftime('%Y%m%d')}.csv"
+            )
+            if existing_score_path.exists():
+                score_paths.append(existing_score_path)
+            continue
         fin_asof, shp_asof, ann_asof = filter_fundamentals_as_of(
             financial_results,
             shareholding,
@@ -2641,12 +2666,19 @@ def generate_fundamental_score_history(
         score_paths.append(result.scores_path)
 
     history = pd.concat(all_scores, ignore_index=True, sort=False) if all_scores else pd.DataFrame()
-    history_dir = output_dir / "fundamentals" / "fundamental_scores_history"
-    history_dir.mkdir(parents=True, exist_ok=True)
+    if not history.empty and {"score_date", "symbol"}.issubset(history.columns):
+        history = (
+            history.sort_values(["score_date", "symbol"])
+            .drop_duplicates(["score_date", "symbol"], keep="last")
+            .reset_index(drop=True)
+        )
     history_path = history_dir / (
         f"screener_fundamental_scores_history_{score_dates[0].strftime('%Y%m%d')}_"
         f"{score_dates[-1].strftime('%Y%m%d')}.csv"
     )
+    for path in history_dir.glob("*fundamental_scores_history_*.csv"):
+        if path != history_path:
+            path.unlink()
     history.to_csv(history_path, index=False)
     return FundamentalScoreHistoryResult(
         history_path=history_path,
@@ -4113,7 +4145,10 @@ def main() -> None:
         print(f"Fundamental scores: {len(scores.scores)} rows -> {scores.scores_path}")
         print(f"Fundamental score changes: {changed_count}")
 
-    if args.fundamental_score_history:
+    should_generate_fundamental_history = args.fundamental_score_history or (
+        args.backtests and args.fundamental_scores
+    )
+    if should_generate_fundamental_history:
         if fundamentals is None:
             raise RuntimeError("Fundamentals are required before fundamental score history can be generated.")
         history = generate_fundamental_score_history(
