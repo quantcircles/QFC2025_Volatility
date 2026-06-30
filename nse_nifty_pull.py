@@ -3224,6 +3224,8 @@ def build_rebalance_holdings(
                     "rebalance_block": block_number,
                     "start_date": start_dt.strftime("%Y-%m-%d"),
                     "end_date": end_dt.strftime("%Y-%m-%d"),
+                    "holding_calendar_days": block.get("holding_calendar_days"),
+                    "priced_holding_calendar_days": (end_dt.date() - start_dt.date()).days + 1,
                     "symbol": symbol,
                     "score": holding.get("score"),
                     "weight": weight,
@@ -3244,11 +3246,29 @@ def build_rebalance_holdings(
     return path
 
 
+def calendar_rebalance_windows(
+    dates: Iterable[pd.Timestamp | np.datetime64 | str],
+    holding_calendar_days: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    ordered = [pd.Timestamp(value).normalize() for value in sorted(dates)]
+    windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    start_idx = 0
+    while start_idx < len(ordered):
+        start_dt = ordered[start_idx]
+        target_end = start_dt + pd.Timedelta(days=max(holding_calendar_days, 1) - 1)
+        end_idx = start_idx
+        while end_idx + 1 < len(ordered) and ordered[end_idx + 1] <= target_end:
+            end_idx += 1
+        windows.append((start_dt, ordered[end_idx]))
+        start_idx = end_idx + 1
+    return windows
+
+
 def generate_strategy_backtests(
     output_dir: Path = Path("data_cache/nse_equity"),
     initial_capital: float = 100000.0,
     transaction_cost: float = 0.0001,
-    holding_days: int = 30,
+    holding_calendar_days: int = 31,
     top_n: int = 10,
 ) -> BacktestResult:
     backtest_dir = output_dir / "backtests"
@@ -3380,9 +3400,7 @@ def generate_strategy_backtests(
         backtest_paths.append(backtest_path)
 
         blocks = []
-        for block_number, start_idx in enumerate(range(0, len(dates), holding_days), start=1):
-            start_dt = dates[start_idx]
-            end_dt = dates[min(start_idx + holding_days - 1, len(dates) - 1)]
+        for start_dt, end_dt in calendar_rebalance_windows(dates, holding_calendar_days):
             snap = selected_data[selected_data["score_date"].eq(start_dt)].copy()
             snap["score"] = snap[score_column].clip(lower=0)
             total_score = snap["score"].sum()
@@ -3391,6 +3409,7 @@ def generate_strategy_backtests(
                 {
                     "start_date": pd.Timestamp(start_dt).strftime("%Y-%m-%d"),
                     "end_date": pd.Timestamp(end_dt).strftime("%Y-%m-%d"),
+                    "holding_calendar_days": holding_calendar_days,
                     "holdings": snap.sort_values("weight", ascending=False)[["symbol", "score", "weight"]].to_dict("records"),
                 }
             )

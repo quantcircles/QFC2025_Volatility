@@ -315,7 +315,7 @@ When `--backtests` is used, generated files include:
 - `backtests/*_top10_score_weighted_holdings.csv`
   - Rebalance holdings for each strategy, including score, weight, integer
     previous quantity, integer target quantity, integer quantity change, entry
-    close, end close, and holding-period return.
+    close, end close, holding calendar days, and holding-period return.
 
 - `backtests/*_score_weighted_symbol_metrics.csv`
   - Per-symbol return/risk/Sharpe/drawdown metrics used to rank strategy
@@ -483,6 +483,8 @@ All strategy backtests start with `100000` initial capital and apply `0.01%`
 transaction cost on exposure or weight turnover. Benchmark columns use the
 official NSE NIFTY 50 index close history when cached, with an equal-weight
 NIFTY constituent proxy fallback if index history is unavailable.
+Portfolio holdings are rebalanced on 31-calendar-day windows, with each block
+priced on the last available cached trading date inside the calendar window.
 
 ## HTML Dashboard
 
