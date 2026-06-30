@@ -81,8 +81,13 @@
     .holdings-table th:first-child, .holdings-table td:first-child { text-align: left; }
     .holdings-table th { color: var(--muted); font-size: 11px; font-weight: 760; background: #fbfcfe; }
     .holdings-table tr:last-child td { border-bottom: 0; }
+    .next-rebalance-panel { margin-top: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: var(--shadow); }
+    .next-rebalance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+    .next-rebalance-item { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfcfe; min-width: 0; }
+    .next-rebalance-item .label { color: var(--muted); font-size: 11px; font-weight: 760; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .next-rebalance-item .num { font-size: 17px; font-weight: 760; margin-top: 5px; }
     #backtestChart { width: 100%; height: 380px; display: block; }
-    @media (max-width: 900px) { .app { padding: 20px 14px 28px; } header, .section-head, .holdings-head, .index-head, .chart-head { align-items: stretch; flex-direction: column; } .controls { justify-content: stretch; } label, select { width: 100%; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric-grid, .index-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } canvas { height: 430px; } #indexChart { height: 260px; } #backtestChart { height: 340px; } }
+    @media (max-width: 900px) { .app { padding: 20px 14px 28px; } header, .section-head, .holdings-head, .index-head, .chart-head { align-items: stretch; flex-direction: column; } .controls { justify-content: stretch; } label, select { width: 100%; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric-grid, .index-grid, .next-rebalance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } canvas { height: 430px; } #indexChart { height: 260px; } #backtestChart { height: 340px; } }
     @media (max-width: 520px) { .stats { grid-template-columns: 1fr; } h1 { font-size: 23px; } }
   </style>
 </head>
@@ -194,6 +199,18 @@
             <tbody id="holdingsBody"></tbody>
           </table>
         </div>
+      </div>
+    </section>
+    <section class="next-rebalance-panel">
+      <div>
+        <h2 class="section-title">Next Rebalance Period</h2>
+        <div class="subtle" id="nextRebalanceSummary">-</div>
+      </div>
+      <div class="next-rebalance-grid">
+        <div class="next-rebalance-item"><div class="label">Strategy</div><div class="num" id="nextRebalanceStrategy">-</div></div>
+        <div class="next-rebalance-item"><div class="label">Current Period</div><div class="num" id="nextRebalanceCurrent">-</div></div>
+        <div class="next-rebalance-item"><div class="label">Next Start</div><div class="num" id="nextRebalanceStart">-</div></div>
+        <div class="next-rebalance-item"><div class="label">Next End</div><div class="num" id="nextRebalanceEnd">-</div></div>
       </div>
     </section>
   </main>
@@ -493,6 +510,23 @@
     function numericValues(values) { return values.filter(value => Number.isFinite(value)); }
     function average(values) { const clean = numericValues(values); if (!clean.length) return NaN; return clean.reduce((sum, value) => sum + value, 0) / clean.length; }
     function stdDev(values) { const clean = numericValues(values); if (clean.length < 2) return NaN; const mean = average(clean); return Math.sqrt(clean.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / (clean.length - 1)); }
+    function parseLocalDate(value) {
+      const [year, month, day] = String(value || '').split('-').map(Number);
+      if (!year || !month || !day) return null;
+      return new Date(year, month - 1, day);
+    }
+    function formatLocalDate(value) {
+      if (!(value instanceof Date) || Number.isNaN(value.getTime())) return '-';
+      const year = value.getFullYear();
+      const month = String(value.getMonth() + 1).padStart(2, '0');
+      const day = String(value.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+    function addCalendarDays(value, days) {
+      const out = new Date(value);
+      out.setDate(out.getDate() + days);
+      return out;
+    }
     function computeBenchmarkMetrics(series) {
       if (!series) return null;
       const { dailyReturn = [], cumulativeReturn = [], portfolioValue = [] } = series;
@@ -566,6 +600,27 @@
         </tr>
       `).join('');
     }
+    function renderNextRebalance(bt) {
+      const blocks = bt && bt.holdings ? bt.holdings : [];
+      const current = blocks.find(block => block.isCurrent) || blocks[blocks.length - 1];
+      const label = bt && bt.label ? bt.label : '-';
+      document.getElementById('nextRebalanceStrategy').textContent = label;
+      if (!current) {
+        document.getElementById('nextRebalanceSummary').textContent = 'No holdings history available.';
+        document.getElementById('nextRebalanceCurrent').textContent = '-';
+        document.getElementById('nextRebalanceStart').textContent = '-';
+        document.getElementById('nextRebalanceEnd').textContent = '-';
+        return;
+      }
+      const currentStart = parseLocalDate(current.startDate);
+      if (!currentStart) return;
+      const nextStart = addCalendarDays(currentStart, 31);
+      const nextEnd = addCalendarDays(nextStart, 30);
+      document.getElementById('nextRebalanceCurrent').textContent = `${current.startDate} to ${current.endDate}`;
+      document.getElementById('nextRebalanceStart').textContent = formatLocalDate(nextStart);
+      document.getElementById('nextRebalanceEnd').textContent = formatLocalDate(nextEnd);
+      document.getElementById('nextRebalanceSummary').textContent = `${label} next scheduled 31-calendar-day rebalance window after the current holdings period.`;
+    }
     function drawBacktest() {
       const bt = BACKTEST[backtestType.value];
       if (!bt) return;
@@ -590,6 +645,7 @@
       document.getElementById('btDrawdownBenchmark').textContent = benchmarkMetrics ? `${benchmarkLabel}: ${metricPct(benchmarkMetrics.max_drawdown)}` : `${benchmarkLabel}: -`;
       document.getElementById('btSymbols').innerHTML = bt.topSymbols.map(s => `<span class="chip">${s}</span>`).join('');
       renderHoldings(bt);
+      renderNextRebalance(bt);
 
       const dpr = window.devicePixelRatio || 1;
       const rect = backtestCanvas.getBoundingClientRect();
