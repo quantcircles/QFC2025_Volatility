@@ -165,7 +165,7 @@
           <h2 class="section-title">Top 10 Sharpe Backtest</h2>
           <div class="subtle">Score-aware optimized portfolios, 31-calendar-day rebalance period, 1 lakh initial capital, 0.01% transaction cost on exposure changes.</div>
         </div>
-        <label>Score Strategy<select id="backtestType"><option value="fundamental">Fundamental Score</option><option value="technical">Technical Score</option><option value="average">Average Score</option></select></label>
+        <label>Score Strategy<select id="backtestType"><option value="fundamental">Fundamental Score</option><option value="technical">Technical Score</option><option value="average" selected>Average Score</option></select></label>
       </div>
       <div class="metric-grid">
         <div class="metric"><div class="label">Final Value</div><div class="num" id="btFinalValue">-</div><div class="subvalue" id="btFinalValueBenchmark">Benchmark: -</div></div>
@@ -566,7 +566,7 @@
         max_drawdown: maxDrawdown,
       };
     }
-    function renderHoldings(bt) {
+    function renderHoldings(bt, preserveSelection = true) {
       const blocks = bt.holdings || [];
       const currentValue = holdingPeriod.value;
       holdingPeriod.innerHTML = '';
@@ -576,7 +576,10 @@
         option.textContent = `${block.isCurrent ? 'Current: ' : ''}${block.startDate} to ${block.endDate}`;
         holdingPeriod.appendChild(option);
       });
-      const selectedIndex = Number.isInteger(Number(currentValue)) && blocks[Number(currentValue)] ? Number(currentValue) : blocks.length - 1;
+      const currentIndex = Math.max(0, blocks.findIndex(block => block.isCurrent));
+      const selectedIndex = preserveSelection && Number.isInteger(Number(currentValue)) && blocks[Number(currentValue)]
+        ? Number(currentValue)
+        : (currentIndex >= 0 ? currentIndex : blocks.length - 1);
       if (blocks.length) holdingPeriod.value = String(selectedIndex);
       const block = blocks[selectedIndex];
       const summary = document.getElementById('holdingsSummary');
@@ -644,7 +647,7 @@
       document.getElementById('btSharpeBenchmark').textContent = benchmarkMetrics ? `${benchmarkLabel}: ${metricNum(benchmarkMetrics.sharpe)}` : `${benchmarkLabel}: -`;
       document.getElementById('btDrawdownBenchmark').textContent = benchmarkMetrics ? `${benchmarkLabel}: ${metricPct(benchmarkMetrics.max_drawdown)}` : `${benchmarkLabel}: -`;
       document.getElementById('btSymbols').innerHTML = bt.topSymbols.map(s => `<span class="chip">${s}</span>`).join('');
-      renderHoldings(bt);
+      renderHoldings(bt, false);
       renderNextRebalance(bt);
 
       const dpr = window.devicePixelRatio || 1;
@@ -744,8 +747,9 @@
         backtestCtx.fillText(bt.series.dates[idx].slice(0, 7), x, h - pad.bottom + 16);
       }
     }
+    backtestType.value = 'average';
     backtestType.addEventListener('change', drawBacktest);
-    holdingPeriod.addEventListener('change', () => renderHoldings(BACKTEST[backtestType.value]));
+    holdingPeriod.addEventListener('change', () => renderHoldings(BACKTEST[backtestType.value], true));
     window.addEventListener('resize', drawBacktest);
     drawBacktest();
   </script>
