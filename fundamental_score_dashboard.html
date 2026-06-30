@@ -179,12 +179,13 @@
       <div class="chips" id="btSymbols"></div>
       <div class="legend">
         <span><i class="swatch" style="background:#0f766e"></i> Daily Return</span>
-        <span><i class="swatch" style="background:#b45309"></i> Holding Period Return</span>
+        <span><i class="swatch" style="background:#b45309"></i> Strategy Holding Return</span>
+        <span><i class="swatch" style="background:#334155"></i> NIFTY Holding Return</span>
         <span><i class="swatch" style="background:#7c3aed"></i> Cumulative Return</span>
         <span><i class="swatch" style="background:#111827"></i> NIFTY 50 Benchmark</span>
       </div>
       <canvas id="backtestChart" width="1800" height="620"></canvas>
-      <div class="note">Daily return is plotted as bars around zero; holding period return is plotted as wider bars at each rebalance period end date; strategy cumulative return is plotted as a solid line. The NIFTY overlay uses official NSE NIFTY 50 index closes when cached, with an equal-weight constituent proxy fallback. Top 10 selection is retrospective over the available one-year cache.</div>
+      <div class="note">Daily return is plotted as bars around zero; strategy and NIFTY holding period returns are plotted as paired bars at each rebalance period end date; strategy cumulative return is plotted as a solid line. The NIFTY overlay uses official NSE NIFTY 50 index closes when cached, with an equal-weight constituent proxy fallback. Top 10 selection is retrospective over the available one-year cache.</div>
       <div class="holdings-panel">
         <div class="holdings-head">
           <div>
@@ -664,7 +665,8 @@
       backtestCtx.fillRect(0, 0, w, h);
       const daily = bt.series.dailyReturn;
       const cum = bt.series.cumulativeReturn;
-      const benchmark = BACKTEST.benchmark && BACKTEST.benchmark.series ? BACKTEST.benchmark.series.cumulativeReturn : [];
+      const benchmarkSeriesForChart = BACKTEST.benchmark && BACKTEST.benchmark.series ? BACKTEST.benchmark.series : null;
+      const benchmark = benchmarkSeriesForChart ? (benchmarkSeriesForChart.cumulativeReturn || []) : [];
       const n = cum.length;
       const holdingPeriodReturns = (bt.holdings || []).map(block => {
         const weightedReturn = (block.holdings || []).reduce((sum, holding) => {
@@ -674,7 +676,23 @@
         }, 0);
         return { date: block.endDate, value: weightedReturn };
       }).filter(item => item.date && Number.isFinite(item.value));
-      const all = daily.concat(cum).concat(benchmark).concat(holdingPeriodReturns.map(item => item.value)).filter(Number.isFinite);
+      const strategyDateIndex = new Map((bt.series.dates || []).map((date, i) => [date, i]));
+      const benchmarkDateIndex = new Map(benchmarkSeriesForChart && benchmarkSeriesForChart.dates ? benchmarkSeriesForChart.dates.map((date, i) => [date, i]) : []);
+      const benchmarkHoldingReturns = (bt.holdings || []).map(block => {
+        const startIdx = benchmarkDateIndex.get(block.startDate);
+        const endIdx = benchmarkDateIndex.get(block.endDate);
+        if (startIdx === undefined || endIdx === undefined) return null;
+        const startValue = 1 + benchmark[startIdx];
+        const endValue = 1 + benchmark[endIdx];
+        if (!Number.isFinite(startValue) || !Number.isFinite(endValue) || startValue <= 0) return null;
+        return { date: block.endDate, value: endValue / startValue - 1 };
+      }).filter(Boolean);
+      const all = daily
+        .concat(cum)
+        .concat(benchmark)
+        .concat(holdingPeriodReturns.map(item => item.value))
+        .concat(benchmarkHoldingReturns.map(item => item.value))
+        .filter(Number.isFinite);
       let min = Math.min(...all, -0.01), max = Math.max(...all, 0.01);
       if (min === max) { min -= 0.01; max += 0.01; }
       const y = v => pad.top + ih - ((v - min) / (max - min)) * ih;
@@ -695,14 +713,21 @@
         const yy = y(v);
         backtestCtx.fillRect(x - barW / 2, Math.min(yy, zeroY), barW, Math.abs(zeroY - yy));
       });
-      const dateIndex = new Map((bt.series.dates || []).map((date, i) => [date, i]));
-      const periodBarW = Math.max(7, barW * 2.8);
+      const periodBarW = Math.max(5, barW * 2.1);
       holdingPeriodReturns.forEach(item => {
-        const idx = dateIndex.get(item.date);
+        const idx = strategyDateIndex.get(item.date);
         if (idx === undefined) return;
-        const x = pad.left + idx / Math.max(1, n - 1) * iw;
+        const x = pad.left + idx / Math.max(1, n - 1) * iw - periodBarW * 0.58;
         const yy = y(item.value);
         backtestCtx.fillStyle = item.value >= 0 ? 'rgba(180, 83, 9, 0.82)' : 'rgba(180, 35, 24, 0.82)';
+        backtestCtx.fillRect(x - periodBarW / 2, Math.min(yy, zeroY), periodBarW, Math.abs(zeroY - yy));
+      });
+      benchmarkHoldingReturns.forEach(item => {
+        const idx = strategyDateIndex.get(item.date);
+        if (idx === undefined) return;
+        const x = pad.left + idx / Math.max(1, n - 1) * iw + periodBarW * 0.58;
+        const yy = y(item.value);
+        backtestCtx.fillStyle = item.value >= 0 ? 'rgba(51, 65, 85, 0.78)' : 'rgba(100, 116, 139, 0.78)';
         backtestCtx.fillRect(x - periodBarW / 2, Math.min(yy, zeroY), periodBarW, Math.abs(zeroY - yy));
       });
       backtestCtx.strokeStyle = '#7c3aed';
