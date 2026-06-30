@@ -280,10 +280,36 @@ def nse_display_date(value: date) -> str:
 
 
 def parse_date_series(values: pd.Series) -> pd.Series:
-    try:
-        return pd.to_datetime(values, errors="coerce", dayfirst=True, format="mixed")
-    except TypeError:
-        return pd.to_datetime(values, errors="coerce", dayfirst=True)
+    raw = pd.Series(values)
+    text = raw.astype("string").str.strip()
+    parsed = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+
+    # ISO dates are emitted by the cached daily CSVs. Parse them explicitly so
+    # 2026-06-12 remains June 12 instead of being read as December 6.
+    iso_mask = text.str.match(r"^\d{4}-\d{1,2}-\d{1,2}$", na=False)
+    if iso_mask.any():
+        parsed.loc[iso_mask] = pd.to_datetime(text.loc[iso_mask], errors="coerce", format="%Y-%m-%d")
+
+    compact_iso_mask = text.str.match(r"^\d{8}$", na=False) & parsed.isna()
+    if compact_iso_mask.any():
+        parsed.loc[compact_iso_mask] = pd.to_datetime(
+            text.loc[compact_iso_mask],
+            errors="coerce",
+            format="%Y%m%d",
+        )
+
+    remaining = parsed.isna() & text.notna() & text.ne("")
+    if remaining.any():
+        try:
+            parsed.loc[remaining] = pd.to_datetime(
+                text.loc[remaining],
+                errors="coerce",
+                dayfirst=True,
+                format="mixed",
+            )
+        except TypeError:
+            parsed.loc[remaining] = pd.to_datetime(text.loc[remaining], errors="coerce", dayfirst=True)
+    return parsed
 
 
 def parse_result_period_end(text: str) -> pd.Timestamp:
@@ -2680,6 +2706,16 @@ def cross_sectional_percentile(values: pd.Series, higher_is_better: bool = True)
     return numeric.rank(pct=True, ascending=not higher_is_better) * 100
 
 
+def cleanup_stale_score_files(directory: Path, pattern: str, valid_dates: set[str]) -> int:
+    removed = 0
+    for path in directory.glob(pattern):
+        date_part = path.stem.rsplit("_", 1)[-1]
+        if date_part not in valid_dates:
+            path.unlink()
+            removed += 1
+    return removed
+
+
 def generate_technical_score_history(
     output_dir: Path = Path("data_cache/nse_equity"),
     symbols: Iterable[str] | None = None,
@@ -2831,6 +2867,12 @@ def generate_technical_score_history(
     scores_dir = output_dir / "technicals" / "technical_scores_by_day"
     scores_dir.mkdir(parents=True, exist_ok=True)
     score_paths = []
+    date_values = sorted(scores["score_date"].unique().tolist())
+    valid_date_parts = {score_date.replace("-", "") for score_date in date_values}
+    stale_count = cleanup_stale_score_files(scores_dir, "nse_technical_scores_*.csv", valid_date_parts)
+    if stale_count:
+        print(f"Removed stale technical score files: {stale_count}")
+
     for score_date, day in scores.groupby("score_date", sort=True):
         score_path = scores_dir / f"nse_technical_scores_{score_date.replace('-', '')}.csv"
         day.to_csv(score_path, index=False)
@@ -2838,11 +2880,13 @@ def generate_technical_score_history(
 
     history_dir = output_dir / "technicals" / "technical_scores_history"
     history_dir.mkdir(parents=True, exist_ok=True)
-    date_values = sorted(scores["score_date"].unique().tolist())
     history_path = history_dir / (
         f"nse_technical_scores_history_{date_values[0].replace('-', '')}_"
         f"{date_values[-1].replace('-', '')}.csv"
     )
+    for path in history_dir.glob("nse_technical_scores_history_*.csv"):
+        if path != history_path:
+            path.unlink()
     scores.to_csv(history_path, index=False)
     return TechnicalScoreHistoryResult(
         history_path=history_path,
