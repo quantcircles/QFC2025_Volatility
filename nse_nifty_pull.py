@@ -32,6 +32,66 @@ MONEYCONTROL_HOME = "https://www.moneycontrol.com"
 ECONOMIC_TIMES_HOME = "https://economictimes.indiatimes.com"
 SCREENER_HOME = "https://www.screener.in"
 NIFTY_50_INDEX = "NIFTY 50"
+FRED_GRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+ECONOMIC_SERIES = [
+    {
+        "key": "cpi_yoy_pct",
+        "fred_id": "INDCPIALLMINMEI",
+        "label": "India CPI YoY",
+        "source": "FRED/OECD Main Economic Indicators",
+        "transform": "yoy_pct",
+        "component": "inflation_score",
+        "weight": 0.20,
+        "target": 4.0,
+        "higher_is_better": False,
+        "max_age_days": 548,
+    },
+    {
+        "key": "iip_yoy_pct",
+        "fred_id": "INDPROINDMISMEI",
+        "label": "India Industrial Production YoY",
+        "source": "FRED/OECD Main Economic Indicators",
+        "transform": "yoy_pct",
+        "component": "industrial_score",
+        "weight": 0.30,
+        "higher_is_better": True,
+        "max_age_days": 548,
+    },
+    {
+        "key": "exports_yoy_pct",
+        "fred_id": "XTEXVA01INM667S",
+        "label": "India Exports YoY",
+        "source": "FRED/OECD Main Economic Indicators",
+        "transform": "yoy_pct",
+        "component": "exports_score",
+        "weight": 0.20,
+        "higher_is_better": True,
+        "max_age_days": 548,
+    },
+    {
+        "key": "short_rate_pct",
+        "fred_id": "IRSTCI01INM156N",
+        "label": "India Short-Term Interest Rate",
+        "source": "FRED/OECD Main Economic Indicators",
+        "transform": "level",
+        "component": "rate_support_score",
+        "weight": 0.10,
+        "higher_is_better": False,
+        "max_age_days": 548,
+    },
+    {
+        "key": "gdp_yoy_pct",
+        "fred_id": "MKTGDPINA646NWDB",
+        "label": "India GDP YoY",
+        "source": "FRED/World Bank",
+        "transform": "yoy_pct",
+        "component": "gdp_score",
+        "weight": 0.20,
+        "higher_is_better": True,
+        "max_age_days": 1095,
+    },
+]
 
 
 @dataclass(frozen=True)
@@ -79,6 +139,13 @@ class IndexHistoryResult:
     history_path: Path | None
     index_paths: tuple[Path, ...]
     index_history: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class EconomyScoreResult:
+    variables_path: Path
+    history_path: Path
+    scores: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -2979,6 +3046,185 @@ def backtest_metrics(returns: pd.Series, trading_days: int = 252) -> dict[str, f
     }
 
 
+def download_fred_series(series_id: str, timeout: int = 20) -> pd.DataFrame:
+    response = requests.get(FRED_GRAPH_CSV, params={"id": series_id}, timeout=timeout)
+    response.raise_for_status()
+    frame = pd.read_csv(io.StringIO(response.text))
+    if "observation_date" not in frame or series_id not in frame:
+        raise RuntimeError(f"FRED response for {series_id} did not contain expected columns.")
+    frame = frame.rename(columns={"observation_date": "observation_date", series_id: "raw_value"})
+    frame["observation_date"] = pd.to_datetime(frame["observation_date"], errors="coerce")
+    frame["raw_value"] = pd.to_numeric(frame["raw_value"].replace(".", pd.NA), errors="coerce")
+    return frame.dropna(subset=["observation_date"]).sort_values("observation_date").reset_index(drop=True)
+
+
+def latest_economy_history_path(output_dir: Path = Path("data_cache/nse_equity")) -> Path | None:
+    return latest_csv_file(output_dir / "economy" / "economy_score_history", "fred_india_economy_scores_history_*.csv")
+
+
+def rolling_percentile_score(values: pd.Series, higher_is_better: bool = True, window: int = 120, min_periods: int = 24) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+
+    def percentile(window_values: np.ndarray) -> float:
+        clean = pd.Series(window_values).dropna()
+        if clean.empty:
+            return np.nan
+        current = clean.iloc[-1]
+        rank = (clean <= current).mean() * 100
+        return rank if higher_is_better else 100 - rank
+
+    return numeric.rolling(window, min_periods=min_periods).apply(percentile, raw=True)
+
+
+def economy_state_from_score(score: float | int | None) -> tuple[str, str]:
+    if score is None or not np.isfinite(score):
+        return "unknown", "Economy Unknown"
+    if score >= 65:
+        return "expansion", "Expansionary Economy"
+    if score <= 40:
+        return "slowdown", "Slowdown Economy"
+    return "neutral", "Mixed Economy"
+
+
+def generate_economy_score_history(
+    output_dir: Path = Path("data_cache/nse_equity"),
+    start: date | None = None,
+    end: date | None = None,
+) -> EconomyScoreResult:
+    economy_dir = output_dir / "economy"
+    variables_dir = economy_dir / "economic_variables_history"
+    scores_dir = economy_dir / "economy_score_history"
+    variables_dir.mkdir(parents=True, exist_ok=True)
+    scores_dir.mkdir(parents=True, exist_ok=True)
+
+    variable_frames = []
+    component_frames = []
+    for spec in ECONOMIC_SERIES:
+        series = download_fred_series(str(spec["fred_id"]))
+        series["series_id"] = spec["fred_id"]
+        series["variable"] = spec["key"]
+        series["label"] = spec["label"]
+        series["source"] = spec["source"]
+        series["transform"] = spec["transform"]
+        if spec["transform"] == "yoy_pct":
+            periods = 1 if str(spec["fred_id"]) == "MKTGDPINA646NWDB" else 12
+            series["value"] = series["raw_value"].pct_change(periods) * 100
+        else:
+            series["value"] = series["raw_value"]
+        score_input = (series["value"] - float(spec["target"])).abs() if "target" in spec else series["value"]
+        series[str(spec["component"])] = rolling_percentile_score(score_input, bool(spec["higher_is_better"]))
+        series["component_weight"] = float(spec["weight"])
+        series["max_age_days"] = int(spec["max_age_days"])
+        variable_frames.append(series)
+        component_frame = series[["observation_date", str(spec["component"])]].copy()
+        component_frame[f"{spec['component']}_observation_date"] = component_frame["observation_date"]
+        component_frames.append(
+            component_frame.set_index("observation_date")
+        )
+
+    variables = pd.concat(variable_frames, ignore_index=True, sort=False)
+    variables_stamp = date.today().strftime("%Y%m%d")
+    variables_path = variables_dir / f"fred_india_economic_variables_{variables_stamp}.csv"
+    variables.to_csv(variables_path, index=False)
+
+    components = pd.concat(component_frames, axis=1).sort_index()
+    for spec in ECONOMIC_SERIES:
+        col = str(spec["component"])
+        components[col] = pd.to_numeric(components[col], errors="coerce").ffill()
+        obs_col = f"{col}_observation_date"
+        if obs_col in components:
+            components[obs_col] = pd.to_datetime(components[obs_col], errors="coerce").ffill()
+
+    index_history = load_nifty_index_history(output_dir)
+    if not index_history.empty:
+        dates = pd.Series(pd.to_datetime(index_history["trade_date"], errors="coerce")).dropna().sort_values()
+    else:
+        dates = pd.Series(pd.to_datetime(score_dates_from_price_files(output_dir, start=start, end=end)))
+    if len(dates) == 0:
+        raise RuntimeError("No cached NIFTY dates found for economy score alignment.")
+    if start is not None:
+        dates = dates[dates.dt.date >= start]
+    if end is not None:
+        dates = dates[dates.dt.date <= end]
+    if len(dates) == 0:
+        raise RuntimeError("No cached NIFTY dates remain after applying the economy score date range.")
+
+    daily = pd.DataFrame({"score_date": dates.dt.normalize().drop_duplicates()})
+    daily = pd.merge_asof(
+        daily.sort_values("score_date"),
+        components.reset_index().rename(columns={"observation_date": "score_date"}).sort_values("score_date"),
+        on="score_date",
+        direction="backward",
+    )
+
+    weighted_cols = []
+    total_weight = 0.0
+    for spec in ECONOMIC_SERIES:
+        col = str(spec["component"])
+        weight = float(spec["weight"])
+        if col in daily:
+            obs_col = f"{col}_observation_date"
+            age_col = f"{col}_age_days"
+            if obs_col in daily:
+                daily[obs_col] = pd.to_datetime(daily[obs_col], errors="coerce")
+                daily[age_col] = (pd.to_datetime(daily["score_date"]) - daily[obs_col]).dt.days
+                daily.loc[daily[age_col] > int(spec["max_age_days"]), col] = np.nan
+            weighted_cols.append(daily[col] * weight)
+    valid_weight = pd.Series(0.0, index=daily.index)
+    weighted_sum = pd.Series(0.0, index=daily.index)
+    for spec in ECONOMIC_SERIES:
+        col = str(spec["component"])
+        if col in daily:
+            weight = float(spec["weight"])
+            valid = daily[col].notna()
+            valid_weight = valid_weight + valid.astype(float) * weight
+            weighted_sum = weighted_sum + daily[col].fillna(0) * weight
+    daily["economy_score"] = weighted_sum / valid_weight.replace(0, np.nan)
+    state_values = daily["economy_score"].apply(economy_state_from_score)
+    daily["economy_state"] = state_values.apply(lambda item: item[0])
+    daily["economy_state_label"] = state_values.apply(lambda item: item[1])
+    daily["score_source"] = "FRED India macro series"
+    daily["score_date"] = daily["score_date"].dt.strftime("%Y-%m-%d")
+
+    latest_values = (
+        variables.sort_values("observation_date")
+        .dropna(subset=["value"])
+        .groupby("variable", as_index=False)
+        .tail(1)[["variable", "observation_date", "value"]]
+    )
+    for _, row in latest_values.iterrows():
+        daily[f"{row['variable']}_latest_observation_date"] = row["observation_date"].strftime("%Y-%m-%d")
+        daily[f"{row['variable']}_latest_value"] = row["value"]
+
+    component_cols = [str(spec["component"]) for spec in ECONOMIC_SERIES]
+    component_age_cols = [f"{spec['component']}_age_days" for spec in ECONOMIC_SERIES]
+    component_obs_cols = [f"{spec['component']}_observation_date" for spec in ECONOMIC_SERIES]
+    latest_value_cols = [f"{spec['key']}_latest_value" for spec in ECONOMIC_SERIES]
+    latest_date_cols = [f"{spec['key']}_latest_observation_date" for spec in ECONOMIC_SERIES]
+    ordered_cols = [
+        "score_date",
+        "economy_score",
+        "economy_state",
+        "economy_state_label",
+        *component_cols,
+        *component_age_cols,
+        *component_obs_cols,
+        *latest_value_cols,
+        *latest_date_cols,
+        "score_source",
+    ]
+    daily = daily[[col for col in ordered_cols if col in daily]].sort_values("score_date")
+    history_path = scores_dir / (
+        f"fred_india_economy_scores_history_{daily['score_date'].iloc[0].replace('-', '')}_"
+        f"{daily['score_date'].iloc[-1].replace('-', '')}.csv"
+    )
+    for path in scores_dir.glob("fred_india_economy_scores_history_*.csv"):
+        if path != history_path:
+            path.unlink()
+    daily.to_csv(history_path, index=False)
+    return EconomyScoreResult(variables_path=variables_path, history_path=history_path, scores=daily)
+
+
 def load_nifty_index_history(output_dir: Path = Path("data_cache/nse_equity")) -> pd.DataFrame:
     files = sorted((output_dir / "index_history").glob("nifty50_index_history_*.csv"))
     files.extend(sorted((output_dir / "index_by_day").glob("nifty50_index_*.csv")))
@@ -3046,6 +3292,50 @@ def nifty_index_dashboard_payload(output_dir: Path = Path("data_cache/nse_equity
             "sma200": [json_clean(value) for value in history["sma200"]],
             "return63d": [json_clean(value) for value in history["return63d"]],
             "rsi14": [json_clean(value) for value in history["rsi14"]],
+        },
+    }
+
+
+def economy_dashboard_payload(output_dir: Path = Path("data_cache/nse_equity")) -> dict | None:
+    path = latest_economy_history_path(output_dir)
+    if path is None or not path.exists():
+        return None
+    history = pd.read_csv(path)
+    if history.empty or "score_date" not in history or "economy_score" not in history:
+        return None
+    history = history.copy()
+    history["score_date"] = pd.to_datetime(history["score_date"], errors="coerce")
+    history["economy_score"] = pd.to_numeric(history["economy_score"], errors="coerce")
+    history = history.dropna(subset=["score_date"]).sort_values("score_date")
+    latest = history.dropna(subset=["economy_score"]).iloc[-1] if history["economy_score"].notna().any() else history.iloc[-1]
+    state_key, state_label = economy_state_from_score(float(latest["economy_score"]) if pd.notna(latest["economy_score"]) else np.nan)
+    variable_payload = []
+    for spec in ECONOMIC_SERIES:
+        value_col = f"{spec['key']}_latest_value"
+        date_col = f"{spec['key']}_latest_observation_date"
+        variable_payload.append(
+            {
+                "key": spec["key"],
+                "label": spec["label"],
+                "source": spec["source"],
+                "value": json_clean(latest.get(value_col)),
+                "observationDate": str(latest.get(date_col, "")) if pd.notna(latest.get(date_col, pd.NA)) else "",
+                "weight": json_clean(spec["weight"]),
+            }
+        )
+    return {
+        "source": "FRED India macro series: CPI, industrial production, exports, short-term interest rate, GDP",
+        "state": {
+            "key": state_key,
+            "label": state_label,
+            "asOf": latest["score_date"].strftime("%Y-%m-%d"),
+            "score": json_clean(latest.get("economy_score")),
+        },
+        "variables": variable_payload,
+        "series": {
+            "dates": history["score_date"].dt.strftime("%Y-%m-%d").tolist(),
+            "score": [json_clean(value) for value in history["economy_score"]],
+            "state": history.get("economy_state", pd.Series(dtype=str)).astype(str).tolist(),
         },
     }
 
@@ -3556,6 +3846,7 @@ def build_dashboard_data(output_dir: Path) -> dict:
         "fundamentalVariables": fundamental_variables,
         "technicalVariables": technical_variables,
         "niftyIndex": nifty_index_dashboard_payload(output_dir),
+        "economy": economy_dashboard_payload(output_dir),
         "symbols": symbols,
     }
 
@@ -3792,6 +4083,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download only NIFTY 50 index close history from NSE archives",
     )
     parser.add_argument(
+        "--economy-history",
+        action="store_true",
+        help="Download FRED India macro series and generate daily economy score history",
+    )
+    parser.add_argument(
+        "--economy-history-only",
+        action="store_true",
+        help="Generate economy score history from FRED without pulling NSE data",
+    )
+    parser.add_argument(
         "--fallback-days",
         type=int,
         default=10,
@@ -3892,6 +4193,9 @@ def main() -> None:
     if args.index_history_only:
         args.fundamentals_only = True
         args.index_history = True
+    if args.economy_history_only:
+        args.fundamentals_only = True
+        args.economy_history = True
     if (
         args.backtests
         or args.dashboard_html
@@ -3909,6 +4213,8 @@ def main() -> None:
         and not args.scores_only
         and not args.score_history_only
         and not args.technical_score_history_only
+        and not args.economy_history
+        and not args.economy_history_only
     ):
         args.fundamentals_only = True
     if (
@@ -3923,6 +4229,8 @@ def main() -> None:
         and not args.fundamental_score_history
         and not args.scores_only
         and not args.score_history_only
+        and not args.economy_history
+        and not args.economy_history_only
     ):
         args.fundamentals_only = True
 
@@ -3975,6 +4283,15 @@ def main() -> None:
         )
         print(f"NIFTY index files: {len(index_result.index_paths)}")
         print(f"NIFTY index rows: {len(index_result.index_history)} -> {index_result.history_path}")
+
+    if args.economy_history:
+        economy = generate_economy_score_history(
+            output_dir=args.output_dir,
+            start=args.start,
+            end=args.end,
+        )
+        print(f"Economic variables: {len(economy.scores)} aligned rows -> {economy.variables_path}")
+        print(f"Economy score history: {len(economy.scores)} rows -> {economy.history_path}")
 
     fundamentals = None
     needs_fundamentals = (

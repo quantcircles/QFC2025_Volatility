@@ -34,10 +34,10 @@ jobs:
       - name: Download NSE previous-close files
         run: |
           # Writes the latest available NIFTY 50 close, constituent snapshot,
-          # official NIFTY 50 index close, financial results, shareholding
+          # official NIFTY 50 index close, FRED India macro economy score, financial results, shareholding
           # pattern, fundamental score files, technical score files, and
           # daily strategy backtests with rebalance holdings and dashboard HTML.
-          python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
+          python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --economy-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
 
       - name: Generate daily summary
         run: |

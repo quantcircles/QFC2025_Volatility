@@ -9,6 +9,7 @@ The current workflow pulls NIFTY 50 stock data from official NSE archive sources
 
 - NIFTY 50 constituents from the NSE index constituent CSV.
 - Official NIFTY 50 index closes from the NSE index close archive.
+- FRED India macro series for daily economy score and state checks.
 - Daily cash-market bhavcopy files from NSE archive zip files.
 - Cleaned OHLCV-style rows for selected NIFTY 50 `EQ` symbols.
 - NSE Financial Results corporate filing records.
@@ -33,6 +34,7 @@ backtesting pipelines.
   - Contains the NSE archive client.
   - Pulls NIFTY 50 constituents.
   - Pulls official NIFTY 50 index close history for benchmark and regime checks.
+  - Downloads FRED India macro series and builds economy score history.
   - Downloads and caches daily cash-market bhavcopy files.
   - Filters bhavcopy rows to NIFTY 50 equity symbols.
   - Downloads NSE Financial Results and Shareholding Pattern records.
@@ -105,6 +107,13 @@ regime panel and benchmark overlay:
 ```bash
 python3 portfolioAnalysis_SM.py --index-history-only --last-year
 python3 portfolioAnalysis_SM.py --index-history-only --from 2025-06-02 --to 2026-06-25
+```
+
+Seed or refresh the FRED India macro economy score history used by the dashboard
+economy state overlay:
+
+```bash
+python3 portfolioAnalysis_SM.py --economy-history-only
 ```
 
 Run on a subsequent day to pull the latest available previous close. This skips
@@ -191,7 +200,7 @@ Daily end-to-end run, including latest price/fundamental refresh, score refresh,
 strategy backtests, holdings, and standalone dashboard HTML:
 
 ```bash
-python3 portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
+python3 portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --economy-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
 ```
 
 Generate only the latest and datestamped dashboard HTML from cached histories and
@@ -207,7 +216,7 @@ The daily GitHub Actions workflow in `.github/workflows/daily-summary.yml` runs 
 Indian market weekdays after the regular NSE close. As part of that run, it calls:
 
 ```bash
-python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
+python portfolioAnalysis_SM.py --previous-close --fallback-days 14 --index-history --economy-history --fundamentals --fundamentals-source auto --fundamental-scores --fundamental-score-history --technical-scores --backtests --dashboard-html
 ```
 
 This writes the latest available previous-close NIFTY 50 files and official
@@ -261,6 +270,20 @@ When `--index-history` or `--index-history-only` is used, generated files includ
 - `index_history/nifty50_index_history_STARTDATE_ENDDATE.csv`
   - Combined official NIFTY 50 index history used for dashboard regime
     classification and benchmark overlays.
+
+When `--economy-history` or `--economy-history-only` is used, generated files
+include:
+
+- `economy/economic_variables_history/fred_india_economic_variables_YYYYMMDD.csv`
+  - Raw FRED observations, transformed YoY/level values, component scores,
+    weights, and source metadata for CPI, industrial production, exports,
+    short-term interest rate, and GDP.
+
+- `economy/economy_score_history/fred_india_economy_scores_history_STARTDATE_ENDDATE.csv`
+  - Daily economy score history aligned to cached NIFTY index dates, including
+    state labels, all component score values, observation dates, and component
+    age in calendar days. Stale components are retained for auditability but
+    excluded from the composite score after their configured freshness window.
 
 When `--fundamentals` or `--fundamentals-only` is used, generated files include:
 
