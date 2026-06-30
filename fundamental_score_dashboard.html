@@ -174,12 +174,12 @@
       <div class="chips" id="btSymbols"></div>
       <div class="legend">
         <span><i class="swatch" style="background:#0f766e"></i> Daily Return</span>
-        <span><i class="swatch" style="background:#b45309"></i> Total Period Return</span>
+        <span><i class="swatch" style="background:#b45309"></i> Holding Period Return</span>
         <span><i class="swatch" style="background:#7c3aed"></i> Cumulative Return</span>
         <span><i class="swatch" style="background:#111827"></i> NIFTY 50 Benchmark</span>
       </div>
       <canvas id="backtestChart" width="1800" height="620"></canvas>
-      <div class="note">Daily return is plotted as bars around zero; total period return is plotted as a wider bar at the final date; strategy cumulative return is plotted as a solid line. The NIFTY overlay uses official NSE NIFTY 50 index closes when cached, with an equal-weight constituent proxy fallback. Top 10 selection is retrospective over the available one-year cache.</div>
+      <div class="note">Daily return is plotted as bars around zero; holding period return is plotted as wider bars at each rebalance period end date; strategy cumulative return is plotted as a solid line. The NIFTY overlay uses official NSE NIFTY 50 index closes when cached, with an equal-weight constituent proxy fallback. Top 10 selection is retrospective over the available one-year cache.</div>
       <div class="holdings-panel">
         <div class="holdings-head">
           <div>
@@ -607,8 +607,15 @@
       const cum = bt.series.cumulativeReturn;
       const benchmark = BACKTEST.benchmark && BACKTEST.benchmark.series ? BACKTEST.benchmark.series.cumulativeReturn : [];
       const n = cum.length;
-      const totalPeriodReturn = Number.isFinite(m.total_return) ? m.total_return : (cum.length ? cum[cum.length - 1] : NaN);
-      const all = daily.concat(cum).concat(benchmark).concat([totalPeriodReturn]).filter(Number.isFinite);
+      const holdingPeriodReturns = (bt.holdings || []).map(block => {
+        const weightedReturn = (block.holdings || []).reduce((sum, holding) => {
+          const weight = Number.isFinite(holding.weight) ? holding.weight : 0;
+          const periodReturn = Number.isFinite(holding.periodReturn) ? holding.periodReturn : 0;
+          return sum + weight * periodReturn;
+        }, 0);
+        return { date: block.endDate, value: weightedReturn };
+      }).filter(item => item.date && Number.isFinite(item.value));
+      const all = daily.concat(cum).concat(benchmark).concat(holdingPeriodReturns.map(item => item.value)).filter(Number.isFinite);
       let min = Math.min(...all, -0.01), max = Math.max(...all, 0.01);
       if (min === max) { min -= 0.01; max += 0.01; }
       const y = v => pad.top + ih - ((v - min) / (max - min)) * ih;
@@ -629,19 +636,16 @@
         const yy = y(v);
         backtestCtx.fillRect(x - barW / 2, Math.min(yy, zeroY), barW, Math.abs(zeroY - yy));
       });
-      if (Number.isFinite(totalPeriodReturn) && n > 0) {
-        const x = pad.left + iw;
-        const yy = y(totalPeriodReturn);
-        const totalBarW = Math.max(8, barW * 3.2);
-        backtestCtx.fillStyle = totalPeriodReturn >= 0 ? 'rgba(180, 83, 9, 0.82)' : 'rgba(180, 35, 24, 0.82)';
-        backtestCtx.fillRect(x - totalBarW / 2, Math.min(yy, zeroY), totalBarW, Math.abs(zeroY - yy));
-        backtestCtx.fillStyle = totalPeriodReturn >= 0 ? '#92400e' : '#b42318';
-        backtestCtx.font = '12px system-ui, sans-serif';
-        backtestCtx.textAlign = 'right';
-        backtestCtx.textBaseline = totalPeriodReturn >= 0 ? 'bottom' : 'top';
-        const labelY = totalPeriodReturn >= 0 ? Math.max(pad.top + 12, yy - 5) : Math.min(h - pad.bottom - 12, yy + 5);
-        backtestCtx.fillText(`Total ${metricPct(totalPeriodReturn)}`, Math.min(w - pad.right, x - totalBarW / 2 - 5), labelY);
-      }
+      const dateIndex = new Map((bt.series.dates || []).map((date, i) => [date, i]));
+      const periodBarW = Math.max(7, barW * 2.8);
+      holdingPeriodReturns.forEach(item => {
+        const idx = dateIndex.get(item.date);
+        if (idx === undefined) return;
+        const x = pad.left + idx / Math.max(1, n - 1) * iw;
+        const yy = y(item.value);
+        backtestCtx.fillStyle = item.value >= 0 ? 'rgba(180, 83, 9, 0.82)' : 'rgba(180, 35, 24, 0.82)';
+        backtestCtx.fillRect(x - periodBarW / 2, Math.min(yy, zeroY), periodBarW, Math.abs(zeroY - yy));
+      });
       backtestCtx.strokeStyle = '#7c3aed';
       backtestCtx.lineWidth = 2.4;
       backtestCtx.beginPath();
