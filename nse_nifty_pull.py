@@ -8,6 +8,7 @@ import html
 from html.parser import HTMLParser
 import io
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -3046,6 +3047,129 @@ def backtest_metrics(returns: pd.Series, trading_days: int = 252) -> dict[str, f
     }
 
 
+def normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def black_scholes_call_price(
+    spot: float,
+    strike: float,
+    time_to_expiry_years: float,
+    volatility: float,
+    risk_free_rate: float = 0.065,
+    dividend_yield: float = 0.012,
+) -> float:
+    if spot <= 0 or strike <= 0 or time_to_expiry_years <= 0:
+        return 0.0
+    sigma = max(float(volatility), 0.01)
+    sqrt_t = math.sqrt(time_to_expiry_years)
+    d1 = (
+        math.log(spot / strike)
+        + (risk_free_rate - dividend_yield + 0.5 * sigma * sigma) * time_to_expiry_years
+    ) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    return spot * math.exp(-dividend_yield * time_to_expiry_years) * normal_cdf(d1) - strike * math.exp(
+        -risk_free_rate * time_to_expiry_years
+    ) * normal_cdf(d2)
+
+
+def generate_nifty_buy_write_backtest(
+    output_dir: Path = Path("data_cache/nse_equity"),
+    initial_capital: float = 100000.0,
+    holding_days: int = 30,
+    lookback_years: int = 2,
+    risk_free_rate: float = 0.065,
+    dividend_yield: float = 0.012,
+) -> tuple[Path, Path, pd.DataFrame]:
+    history = load_nifty_index_history(output_dir)
+    if history.empty:
+        raise RuntimeError("No cached NIFTY index history found for buy-write backtest.")
+    history = history.sort_values("trade_date").drop_duplicates("trade_date", keep="last").reset_index(drop=True)
+    end_date = history["trade_date"].max()
+    start_cutoff = end_date - pd.DateOffset(years=lookback_years)
+    history = history[history["trade_date"] >= start_cutoff].reset_index(drop=True)
+    if len(history) < 25:
+        raise RuntimeError("Need at least 25 cached NIFTY index observations for buy-write backtest.")
+
+    history["daily_return"] = history["close"].pct_change()
+    history["trailing_vol_30d"] = history["daily_return"].rolling(30, min_periods=10).std(ddof=1) * np.sqrt(252)
+
+    trades = []
+    equity = float(initial_capital)
+    benchmark_equity = float(initial_capital)
+    index_position = 1
+    while index_position < len(history) - 1:
+        entry = history.iloc[index_position]
+        target_exit = entry["trade_date"] + pd.Timedelta(days=holding_days)
+        exit_candidates = history.index[(history.index > index_position) & (history["trade_date"] >= target_exit)]
+        if len(exit_candidates) == 0:
+            break
+        exit_position = int(exit_candidates[0])
+        exit_row = history.iloc[exit_position]
+
+        spot = float(entry["close"])
+        exit_close = float(exit_row["close"])
+        strike = round(spot / 50.0) * 50.0
+        realized_vol = entry["trailing_vol_30d"]
+        volatility = float(realized_vol) if pd.notna(realized_vol) and realized_vol > 0 else 0.18
+        actual_holding_days = max(1, int((exit_row["trade_date"] - entry["trade_date"]).days))
+        time_to_expiry = actual_holding_days / 365.0
+        premium = black_scholes_call_price(
+            spot=spot,
+            strike=strike,
+            time_to_expiry_years=time_to_expiry,
+            volatility=volatility,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+        )
+        call_payoff = max(exit_close - strike, 0.0)
+        index_return = exit_close / spot - 1.0
+        buy_write_return = (exit_close - spot + premium - call_payoff) / spot
+        equity *= 1.0 + buy_write_return
+        benchmark_equity *= 1.0 + index_return
+
+        trades.append(
+            {
+                "trade_number": len(trades) + 1,
+                "entry_date": entry["trade_date"].strftime("%Y-%m-%d"),
+                "exit_date": exit_row["trade_date"].strftime("%Y-%m-%d"),
+                "holding_calendar_days": actual_holding_days,
+                "entry_close": spot,
+                "exit_close": exit_close,
+                "strike": strike,
+                "moneyness": strike / spot - 1.0,
+                "trailing_vol_30d": volatility,
+                "risk_free_rate": risk_free_rate,
+                "dividend_yield": dividend_yield,
+                "call_premium": premium,
+                "call_premium_pct": premium / spot,
+                "call_payoff": call_payoff,
+                "call_payoff_pct": call_payoff / spot,
+                "index_return": index_return,
+                "buy_write_return": buy_write_return,
+                "strategy_value": equity,
+                "strategy_cumulative_return": equity / initial_capital - 1.0,
+                "benchmark_value": benchmark_equity,
+                "benchmark_cumulative_return": benchmark_equity / initial_capital - 1.0,
+                "option_model": "black_scholes_atm_call_trailing_30d_realized_vol",
+                "source": "official_nse_nifty50_index_close_with_modelled_option_premium",
+            }
+        )
+        index_position = exit_position + 1
+
+    if not trades:
+        raise RuntimeError("No complete 30-calendar-day NIFTY buy-write trades could be generated.")
+
+    backtest = pd.DataFrame(trades)
+    backtest_dir = output_dir / "backtests"
+    backtest_dir.mkdir(parents=True, exist_ok=True)
+    backtest_path = backtest_dir / "nifty_buy_write_30d_backtest.csv"
+    trades_path = backtest_dir / "nifty_buy_write_30d_trades.csv"
+    backtest.to_csv(backtest_path, index=False)
+    backtest.to_csv(trades_path, index=False)
+    return backtest_path, trades_path, backtest
+
+
 def download_fred_series(series_id: str, timeout: int = 20) -> pd.DataFrame:
     response = requests.get(FRED_GRAPH_CSV, params={"id": series_id}, timeout=timeout)
     response.raise_for_status()
@@ -3945,6 +4069,66 @@ def build_backtest_dashboard_data(output_dir: Path) -> dict:
     return payload
 
 
+def build_buy_write_dashboard_data(output_dir: Path) -> dict:
+    path = output_dir / "backtests" / "nifty_buy_write_30d_trades.csv"
+    if not path.exists():
+        return {}
+    trades = pd.read_csv(path)
+    if trades.empty or "buy_write_return" not in trades:
+        return {}
+    period_returns = pd.to_numeric(trades["buy_write_return"], errors="coerce").fillna(0.0)
+    benchmark_returns = pd.to_numeric(trades.get("index_return", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    periods_per_year = 365.0 / 30.0
+    strategy_metrics = backtest_metrics(period_returns, trading_days=periods_per_year)
+    benchmark_metrics = backtest_metrics(benchmark_returns, trading_days=periods_per_year)
+    initial_capital = 100000.0
+    final_value = trades["strategy_value"].iloc[-1] if "strategy_value" in trades else initial_capital * (1 + period_returns).prod()
+    benchmark_final_value = (
+        trades["benchmark_value"].iloc[-1]
+        if "benchmark_value" in trades
+        else initial_capital * (1 + benchmark_returns).prod()
+    )
+    strategy_metrics["final_value"] = json_clean(final_value)
+    benchmark_metrics["final_value"] = json_clean(benchmark_final_value)
+    return {
+        "label": "NIFTY 30D Buy-Write",
+        "source": str(trades.get("source", pd.Series(["modelled"])).dropna().iloc[-1]) if "source" in trades else "modelled",
+        "model": str(trades.get("option_model", pd.Series(["modelled"])).dropna().iloc[-1]) if "option_model" in trades else "modelled",
+        "dateRange": [str(trades["entry_date"].iloc[0]), str(trades["exit_date"].iloc[-1])],
+        "metrics": {key: json_clean(value) for key, value in strategy_metrics.items()},
+        "benchmarkMetrics": {key: json_clean(value) for key, value in benchmark_metrics.items()},
+        "series": {
+            "dates": trades["exit_date"].astype(str).tolist(),
+            "strategyReturn": [json_clean(value) for value in trades["buy_write_return"]],
+            "benchmarkReturn": [json_clean(value) for value in trades.get("index_return", pd.Series(dtype=float))],
+            "cumulativeReturn": [json_clean(value) for value in trades.get("strategy_cumulative_return", pd.Series(dtype=float))],
+            "benchmarkCumulativeReturn": [
+                json_clean(value) for value in trades.get("benchmark_cumulative_return", pd.Series(dtype=float))
+            ],
+            "portfolioValue": [json_clean(value) for value in trades.get("strategy_value", pd.Series(dtype=float))],
+            "benchmarkValue": [json_clean(value) for value in trades.get("benchmark_value", pd.Series(dtype=float))],
+        },
+        "trades": [
+            {
+                "tradeNumber": json_clean(row.get("trade_number")),
+                "entryDate": row.get("entry_date"),
+                "exitDate": row.get("exit_date"),
+                "holdingDays": json_clean(row.get("holding_calendar_days")),
+                "entryClose": json_clean(row.get("entry_close")),
+                "exitClose": json_clean(row.get("exit_close")),
+                "strike": json_clean(row.get("strike")),
+                "trailingVol30d": json_clean(row.get("trailing_vol_30d")),
+                "premiumPct": json_clean(row.get("call_premium_pct")),
+                "payoffPct": json_clean(row.get("call_payoff_pct")),
+                "indexReturn": json_clean(row.get("index_return")),
+                "strategyReturn": json_clean(row.get("buy_write_return")),
+                "cumulativeReturn": json_clean(row.get("strategy_cumulative_return")),
+            }
+            for _, row in trades.iterrows()
+        ],
+    }
+
+
 def generate_dashboard_html(
     output_dir: Path = Path("data_cache/nse_equity"),
     template_path: Path = Path("fundamental_score_dashboard.html"),
@@ -3954,10 +4138,12 @@ def generate_dashboard_html(
         raise RuntimeError(f"Dashboard template not found: {template_path}")
     dashboard_data = build_dashboard_data(output_dir)
     backtest_data = build_backtest_dashboard_data(output_dir)
+    buy_write_data = build_buy_write_dashboard_data(output_dir)
     html = template_path.read_text()
     replacements = {
         "dashboard-data": json.dumps(dashboard_data, separators=(",", ":")),
         "backtest-data": json.dumps(backtest_data, separators=(",", ":")),
+        "buy-write-data": json.dumps(buy_write_data, separators=(",", ":")),
     }
     for script_id, payload in replacements.items():
         pattern = rf'(<script id="{script_id}" type="application/json">)(.*?)(</script>)'
@@ -4161,6 +4347,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate daily strategy backtests and rebalance holdings from cached score histories",
     )
     parser.add_argument(
+        "--buy-write-backtest",
+        action="store_true",
+        help="Generate 30-calendar-day modelled NIFTY index buy-write backtest from cached index history",
+    )
+    parser.add_argument(
         "--dashboard-html",
         action="store_true",
         help="Generate latest and datestamped standalone HTML dashboard from cached histories and backtests",
@@ -4198,6 +4389,7 @@ def main() -> None:
         args.economy_history = True
     if (
         args.backtests
+        or args.buy_write_backtest
         or args.dashboard_html
     ) and (
         not args.previous_close
@@ -4536,6 +4728,18 @@ def main() -> None:
         for path in backtests.holdings_paths:
             print(f"Holdings: {path}")
         print(f"Selected strategy metrics: {backtests.selected_metrics_path}")
+        buy_write_path, buy_write_trades_path, buy_write = generate_nifty_buy_write_backtest(
+            output_dir=args.output_dir,
+        )
+        print(f"NIFTY buy-write backtest: {len(buy_write)} trades -> {buy_write_path}")
+        print(f"NIFTY buy-write trades: {buy_write_trades_path}")
+
+    if args.buy_write_backtest and not args.backtests:
+        buy_write_path, buy_write_trades_path, buy_write = generate_nifty_buy_write_backtest(
+            output_dir=args.output_dir,
+        )
+        print(f"NIFTY buy-write backtest: {len(buy_write)} trades -> {buy_write_path}")
+        print(f"NIFTY buy-write trades: {buy_write_trades_path}")
 
     if args.dashboard_html:
         latest_path, dated_path = generate_dashboard_html(

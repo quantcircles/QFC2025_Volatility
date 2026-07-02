@@ -196,6 +196,13 @@ Generate strategy backtests from cached fundamental and technical score history:
 python3 portfolioAnalysis_SM.py --backtests
 ```
 
+Generate only the modelled NIFTY 50 buy-write backtest from cached official index
+history:
+
+```bash
+python3 portfolioAnalysis_SM.py --buy-write-backtest
+```
+
 Daily end-to-end run, including latest price/fundamental refresh, score refresh,
 strategy backtests, holdings, and standalone dashboard HTML:
 
@@ -224,7 +231,8 @@ NIFTY 50 index close into `data_cache/nse_equity/`, and writes Financial Results
 and Shareholding Pattern CSVs into `data_cache/nse_equity/fundamentals/`. It also
 writes financial-result announcement CSVs, a daily fundamental score CSV, and
 technical score CSVs computed from the full cached price history. It then
-generates the strategy backtest and holdings CSVs under
+generates the strategy backtest, holdings CSVs, and modelled NIFTY 30-day
+buy-write CSVs under
 `data_cache/nse_equity/backtests/`. The workflow
 also writes `fundamental_score_dashboard.html` and a datestamped dashboard under
 `dashboards/`. It then commits generated report files, NSE data files, and
@@ -346,6 +354,15 @@ When `--backtests` is used, generated files include:
 
 - `backtests/selected_top10_score_weighted_symbol_metrics.csv`
   - Combined top-10 symbol metrics across all strategies.
+
+- `backtests/nifty_buy_write_30d_backtest.csv`
+  - Closed 30-calendar-day NIFTY buy-write backtest periods, strategy value,
+    benchmark value, and cumulative returns.
+
+- `backtests/nifty_buy_write_30d_trades.csv`
+  - Trade-level NIFTY buy-write replication details: entry/exit dates, NIFTY
+    closes, strike, trailing volatility, modelled call premium, call payoff,
+    index return, strategy return, and cumulative return.
 
 When `--dashboard-html` is used, generated files include:
 
@@ -502,12 +519,22 @@ Generated strategies:
   - Selects the 10 symbols with the highest realized score-weighted Sharpe from
     the available history.
 
+- `nifty_buy_write_30d`
+  - Uses official cached NIFTY 50 index closes.
+  - Buys the index and sells a modelled at-the-money call for each closed
+    30-calendar-day holding period.
+  - Uses Black-Scholes premium estimates from trailing 30-day realized
+    volatility because historical option-chain premiums are not cached.
+
 All strategy backtests start with `100000` initial capital and apply `0.01%`
 transaction cost on exposure or weight turnover. Benchmark columns use the
 official NSE NIFTY 50 index close history when cached, with an equal-weight
 NIFTY constituent proxy fallback if index history is unavailable.
 Portfolio holdings are rebalanced on 31-calendar-day windows, with each block
 priced on the last available cached trading date inside the calendar window.
+The buy-write backtest does not apply equity turnover transaction costs; its
+CSV focuses on option premium, option payoff, index return, and strategy return
+replication.
 
 ## HTML Dashboard
 
@@ -516,7 +543,7 @@ from the cached price, fundamental score, and technical score history files. It
 shows a top-level NIFTY 50 index panel using official NSE index closes, SMA50,
 SMA200, 63-trading-day return, and RSI14 to label the market as bull, bear, or
 range-bound.
-embeds the required data directly and lets you choose:
+It embeds the required data directly and lets you choose:
 
 - NIFTY symbol
 - Fundamental variable
@@ -525,6 +552,17 @@ embeds the required data directly and lets you choose:
 The chart shows close price, fundamental score, technical score, the selected
 fundamental variable, and the selected technical indicator on a normalized
 0-100 comparison axis. Hovering the chart shows raw values for each series.
+
+The second dashboard tab shows the modelled NIFTY 30-calendar-day buy-write
+strategy. It plots buy-write and NIFTY period returns as bars, cumulative
+buy-write and NIFTY returns as lines, summary performance/risk metrics, and the
+full trade table.
+
+The buy-write backtest uses cached official NIFTY 50 index closes. Because this
+repository does not currently cache historical NIFTY option-chain prices, the
+short call premium is modelled with Black-Scholes using trailing 30-day realized
+NIFTY volatility, a 6.5% risk-free rate, and a 1.2% dividend yield. The CSV
+includes all premium and payoff inputs so the strategy return can be replicated.
 
 ## Current Behavior
 
@@ -625,7 +663,10 @@ Expected result:
   trading day and one combined index history CSV.
 - With `--backtests`, three strategy backtest CSVs, three strategy holdings CSVs,
   three per-strategy symbol metrics CSVs, and one combined selected top-10 metrics
-  CSV under `data_cache/nse_equity/backtests/`.
+  CSV under `data_cache/nse_equity/backtests/`, plus the NIFTY buy-write trade
+  and backtest CSVs.
+- With `--buy-write-backtest`, one modelled NIFTY 30-calendar-day buy-write
+  trade CSV and one matching backtest CSV.
 - With `--dashboard-html`, the latest standalone HTML dashboard and one
   datestamped copy under `dashboards/`.
 

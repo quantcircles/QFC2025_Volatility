@@ -1,0 +1,2 @@
+trade_date,index_name,open,high,low,close,points_change,change_pct,volume,turnover_rs_cr,pe,pb,div_yield,source
+2024-07-30,NIFTY 50,24839.4,24971.75,24798.65,24857.3,21.2,0.09,384989431,37576.58,23.31,4.19,1.19,nse_index_close_archive
