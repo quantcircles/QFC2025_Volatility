@@ -2692,6 +2692,7 @@ def generate_fundamental_score_history(
     history_dir.mkdir(parents=True, exist_ok=True)
     wanted_date_values = {score_date.isoformat() for score_date in score_dates}
     existing_by_date: dict[str, pd.DataFrame] = {}
+    existing_path_by_date: dict[str, Path] = {}
     for path in sorted(history_dir.glob("*fundamental_scores_history_*.csv")):
         existing = pd.read_csv(path)
         if existing.empty or "score_date" not in existing.columns:
@@ -2700,6 +2701,30 @@ def generate_fundamental_score_history(
         existing = existing[existing["score_date"].isin(wanted_date_values)].copy()
         for score_date, day_scores in existing.groupby("score_date", sort=False):
             existing_by_date[score_date] = day_scores.copy()
+            existing_path_by_date[score_date] = path
+
+    daily_scores_dir = output_dir / "fundamentals" / "fundamental_scores_by_day"
+    for score_date in score_dates:
+        score_date_value = score_date.isoformat()
+        if score_date_value in existing_by_date:
+            continue
+        day_path = daily_scores_dir / f"screener_fundamental_scores_{score_date.strftime('%Y%m%d')}.csv"
+        if not day_path.exists():
+            legacy_day_path = daily_scores_dir / f"nse_fundamental_scores_{score_date.strftime('%Y%m%d')}.csv"
+            day_path = legacy_day_path if legacy_day_path.exists() else day_path
+        if not day_path.exists():
+            continue
+        day_scores = pd.read_csv(day_path)
+        if day_scores.empty:
+            continue
+        if "score_date" not in day_scores.columns:
+            day_scores["score_date"] = score_date_value
+        day_scores["score_date"] = parse_date_series(day_scores["score_date"]).dt.strftime("%Y-%m-%d")
+        day_scores = day_scores[day_scores["score_date"].eq(score_date_value)].copy()
+        if day_scores.empty:
+            continue
+        existing_by_date[score_date_value] = day_scores
+        existing_path_by_date[score_date_value] = day_path
 
     all_scores = []
     score_paths = []
@@ -2707,14 +2732,8 @@ def generate_fundamental_score_history(
         score_date_value = score_date.isoformat()
         if score_date_value in existing_by_date:
             all_scores.append(existing_by_date[score_date_value])
-            existing_score_path = (
-                output_dir
-                / "fundamentals"
-                / "fundamental_scores_by_day"
-                / f"screener_fundamental_scores_{score_date.strftime('%Y%m%d')}.csv"
-            )
-            if existing_score_path.exists():
-                score_paths.append(existing_score_path)
+            if score_date_value in existing_path_by_date:
+                score_paths.append(existing_path_by_date[score_date_value])
             continue
         fin_asof, shp_asof, ann_asof = filter_fundamentals_as_of(
             financial_results,
@@ -4679,14 +4698,16 @@ def main() -> None:
     if should_generate_fundamental_history:
         if fundamentals is None:
             raise RuntimeError("Fundamentals are required before fundamental score history can be generated.")
+        history_start = None if args.backtests else args.start
+        history_end = None if args.backtests else args.end
         history = generate_fundamental_score_history(
             financial_results=fundamentals.financial_results,
             shareholding=fundamentals.shareholding,
             financial_announcements=fundamentals.financial_announcements,
             output_dir=args.output_dir,
             symbols=args.symbols,
-            start=args.start,
-            end=args.end,
+            start=history_start,
+            end=history_end,
         )
         changed_count = (
             int(history.scores["score_changed"].fillna(False).sum())
