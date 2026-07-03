@@ -3554,12 +3554,44 @@ def optimize_mvo_weights(history: pd.DataFrame, min_weight: float = 0.02, max_we
     return weights / weights.sum()
 
 
+def enforce_long_only_weight_bounds(weights: np.ndarray, min_weight: float, max_weight: float) -> np.ndarray:
+    if len(weights) == 0:
+        return weights
+    weights = np.asarray(weights, dtype=float)
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    if weights.sum() <= 0:
+        weights = np.repeat(1 / len(weights), len(weights))
+    else:
+        weights = weights / weights.sum()
+    min_weight = max(float(min_weight), 0.0)
+    max_weight = min(max(float(max_weight), min_weight), 1.0)
+    if min_weight * len(weights) > 1 or max_weight * len(weights) < 1:
+        return np.repeat(1 / len(weights), len(weights))
+    weights = np.clip(weights, min_weight, max_weight)
+    for _ in range(100):
+        diff = 1.0 - float(weights.sum())
+        if abs(diff) < 1e-12:
+            break
+        if diff > 0:
+            capacity = np.maximum(max_weight - weights, 0.0)
+            if capacity.sum() <= 1e-12:
+                break
+            weights += capacity / capacity.sum() * min(diff, float(capacity.sum()))
+        else:
+            capacity = np.maximum(weights - min_weight, 0.0)
+            if capacity.sum() <= 1e-12:
+                break
+            weights -= capacity / capacity.sum() * min(-diff, float(capacity.sum()))
+    return weights / weights.sum()
+
+
 def optimize_score_weights(
     history: pd.DataFrame,
     scores: pd.Series,
     min_weight: float = 0.02,
     max_weight: float = 0.25,
     risk_aversion: float = 0.55,
+    concentration_penalty: float = 0.05,
 ) -> np.ndarray:
     symbols = list(scores.index)
     n = len(symbols)
@@ -3569,7 +3601,7 @@ def optimize_score_weights(
     score_alpha = ((clean_scores - clean_scores.min()) / max(clean_scores.max() - clean_scores.min(), 1e-9)).to_numpy()
     if history is None or history.empty or history.shape[0] < 20:
         base = np.maximum(score_alpha, 0.05)
-        return base / base.sum()
+        return enforce_long_only_weight_bounds(base, min_weight, max_weight)
 
     hist = history[symbols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     mu = hist.mean().to_numpy() * 252
@@ -3581,10 +3613,10 @@ def optimize_score_weights(
         expected = float(np.dot(weights, alpha))
         risk = float(np.sqrt(max(np.dot(weights, np.dot(cov, weights)), 1e-12)))
         concentration = float(np.sum(weights ** 2))
-        return -(expected - risk_aversion * risk - 0.05 * concentration)
+        return -(expected - risk_aversion * risk - concentration_penalty * concentration)
 
     x0 = np.maximum(score_alpha, 0.05)
-    x0 = x0 / x0.sum()
+    x0 = enforce_long_only_weight_bounds(x0, min_weight, max_weight)
     result = minimize(
         objective,
         x0,
@@ -3595,8 +3627,7 @@ def optimize_score_weights(
     )
     if not result.success or not np.all(np.isfinite(result.x)):
         return x0
-    weights = np.clip(result.x, min_weight, max_weight)
-    return weights / weights.sum()
+    return enforce_long_only_weight_bounds(result.x, min_weight, max_weight)
 
 
 def add_market_regime(data: pd.DataFrame) -> pd.DataFrame:
@@ -3803,9 +3834,10 @@ def generate_strategy_backtests(
             "optimized": True,
             "candidate_count": top_n,
             "lookback_days": 126,
-            "min_weight": 0.03,
-            "max_weight": 0.20,
-            "risk_aversion": 1.00,
+            "min_weight": 0.02,
+            "max_weight": 0.18,
+            "risk_aversion": 1.20,
+            "concentration_penalty": 0.03,
         },
     ]
 
@@ -3875,6 +3907,7 @@ def generate_strategy_backtests(
                     min_weight=float(setting.get("min_weight", 0.03)),
                     max_weight=float(setting.get("max_weight", 0.20)),
                     risk_aversion=float(setting.get("risk_aversion", 1.00)),
+                    concentration_penalty=float(setting.get("concentration_penalty", 0.05)),
                 )
                 snap["weight"] = pd.Series(weights, index=score_series.index).reindex(snap["symbol"]).to_numpy()
             else:
