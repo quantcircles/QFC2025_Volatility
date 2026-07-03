@@ -3798,46 +3798,22 @@ def generate_strategy_backtests(
         metrics_path = backtest_dir / f"{strategy}_score_weighted_symbol_metrics.csv"
         symbol_metrics_df.to_csv(metrics_path, index=False)
         symbol_metrics_paths.append(metrics_path)
-        selected_symbols = symbol_metrics_df.head(top_n)["symbol"].tolist()
-        selected_metrics_frames.append(symbol_metrics_df.head(top_n))
-
-        selected_data = scored[scored["symbol"].isin(selected_symbols)].copy()
-        dates = sorted(selected_data["score_date"].dropna().unique())
-        previous_exposure = {symbol: 0.0 for symbol in selected_symbols}
+        dates = sorted(scored["score_date"].dropna().unique())
+        rebalance_windows = calendar_rebalance_windows(dates, holding_calendar_days)
+        previous_weights: dict[str, float] = {}
         equity = initial_capital
         rows = []
-        for score_date in dates:
-            day = selected_data[selected_data["score_date"].eq(score_date)]
-            returns = day.set_index("symbol")["symbol_return"].to_dict()
-            exposures = day.set_index("symbol")["score_exposure"].to_dict()
-            gross_return = 0.0
-            turnover = 0.0
-            for symbol in selected_symbols:
-                exposure = float(exposures.get(symbol, 0.0) or 0.0)
-                gross_return += (1 / top_n) * exposure * float(returns.get(symbol, 0.0) or 0.0)
-                turnover += (1 / top_n) * abs(exposure - previous_exposure.get(symbol, 0.0))
-                previous_exposure[symbol] = exposure
-            daily_return = gross_return - transaction_cost * turnover
-            equity *= 1 + daily_return
-            rows.append(
-                {
-                    "date": pd.Timestamp(score_date).strftime("%Y-%m-%d"),
-                    "daily_return": daily_return,
-                    "cumulative_return": equity / initial_capital - 1,
-                    "portfolio_value": equity,
-                }
-            )
-        backtest = add_benchmark_columns(pd.DataFrame(rows), data, initial_capital, output_dir=output_dir)
-        backtest_path = backtest_dir / f"{strategy}_top10_score_weighted_backtest.csv"
-        backtest.to_csv(backtest_path, index=False)
-        backtest_paths.append(backtest_path)
-
         blocks = []
-        for start_dt, end_dt in calendar_rebalance_windows(dates, holding_calendar_days):
-            snap = selected_data[selected_data["score_date"].eq(start_dt)].copy()
+        latest_selected_symbols: list[str] = []
+        for start_dt, end_dt in rebalance_windows:
+            snap = scored[scored["score_date"].eq(start_dt)].copy()
             snap["score"] = snap[score_column].clip(lower=0)
+            snap = snap.dropna(subset=["score", "close"]).sort_values(["score", "symbol"], ascending=[False, True]).head(top_n)
+            if snap.empty:
+                continue
             total_score = snap["score"].sum()
             snap["weight"] = snap["score"] / total_score if total_score else 1 / len(snap)
+            current_weights = snap.set_index("symbol")["weight"].astype(float).to_dict()
             blocks.append(
                 {
                     "start_date": pd.Timestamp(start_dt).strftime("%Y-%m-%d"),
@@ -3846,10 +3822,49 @@ def generate_strategy_backtests(
                     "holdings": snap.sort_values("weight", ascending=False)[["symbol", "score", "weight"]].to_dict("records"),
                 }
             )
+
+            turnover_symbols = set(previous_weights) | set(current_weights)
+            turnover = sum(abs(current_weights.get(symbol, 0.0) - previous_weights.get(symbol, 0.0)) for symbol in turnover_symbols)
+            window_dates = [score_date for score_date in dates if pd.Timestamp(start_dt) <= pd.Timestamp(score_date) <= pd.Timestamp(end_dt)]
+            for score_date in window_dates:
+                if pd.Timestamp(score_date).normalize() == pd.Timestamp(start_dt).normalize():
+                    daily_return = -transaction_cost * turnover
+                else:
+                    day_returns = (
+                        scored[
+                            scored["score_date"].eq(score_date)
+                            & scored["symbol"].isin(current_weights)
+                        ]
+                        .set_index("symbol")["symbol_return"]
+                        .to_dict()
+                    )
+                    daily_return = sum(
+                        weight * float(day_returns.get(symbol, 0.0) or 0.0)
+                        for symbol, weight in current_weights.items()
+                    )
+                equity *= 1 + daily_return
+                rows.append(
+                    {
+                        "date": pd.Timestamp(score_date).strftime("%Y-%m-%d"),
+                        "daily_return": daily_return,
+                        "cumulative_return": equity / initial_capital - 1,
+                        "portfolio_value": equity,
+                    }
+                )
+            previous_weights = current_weights
+            latest_selected_symbols = snap["symbol"].astype(str).tolist()
+
+        backtest = add_benchmark_columns(pd.DataFrame(rows), data, initial_capital, output_dir=output_dir)
+        backtest_path = backtest_dir / f"{strategy}_top10_score_weighted_backtest.csv"
+        backtest.to_csv(backtest_path, index=False)
+        backtest_paths.append(backtest_path)
+        if latest_selected_symbols:
+            selected_metrics_frames.append(symbol_metrics_df[symbol_metrics_df["symbol"].isin(latest_selected_symbols)].copy())
         holdings_paths.append(build_rebalance_holdings(strategy, blocks, data, backtest, backtest_dir))
 
     selected_metrics_path = backtest_dir / "selected_top10_score_weighted_symbol_metrics.csv"
-    pd.concat(selected_metrics_frames, ignore_index=True, sort=False).to_csv(selected_metrics_path, index=False)
+    selected_metrics = pd.concat(selected_metrics_frames, ignore_index=True, sort=False) if selected_metrics_frames else pd.DataFrame()
+    selected_metrics.to_csv(selected_metrics_path, index=False)
     return BacktestResult(
         backtest_paths=tuple(backtest_paths),
         holdings_paths=tuple(holdings_paths),
@@ -4056,11 +4071,12 @@ def build_backtest_dashboard_data(output_dir: Path) -> dict:
             }
             if "benchmark_source" in backtest and backtest["benchmark_source"].notna().any():
                 benchmark_source = str(backtest["benchmark_source"].dropna().iloc[-1])
-        strategy_selected = selected[selected.get("score_type", pd.Series(dtype=str)).eq(strategy)].copy()
-        if not strategy_selected.empty and "sharpe" in strategy_selected:
-            top_symbols = strategy_selected.sort_values("sharpe", ascending=False)["symbol"].astype(str).tolist()
+        holdings = holdings_blocks_from_csv(backtest_dir / f"{strategy}_top10_score_weighted_holdings.csv")
+        if holdings:
+            top_symbols = [holding["symbol"] for holding in holdings[-1].get("holdings", [])]
         else:
-            top_symbols = []
+            strategy_selected = selected[selected.get("score_type", pd.Series(dtype=str)).eq(strategy)].copy()
+            top_symbols = strategy_selected["symbol"].astype(str).tolist() if "symbol" in strategy_selected else []
         payload[strategy] = {
             "label": label,
             "topSymbols": top_symbols[:10],
@@ -4071,7 +4087,7 @@ def build_backtest_dashboard_data(output_dir: Path) -> dict:
                 "cumulativeReturn": [json_clean(value) for value in backtest["cumulative_return"]],
                 "portfolioValue": [json_clean(value) for value in backtest["portfolio_value"]],
             },
-            "holdings": holdings_blocks_from_csv(backtest_dir / f"{strategy}_top10_score_weighted_holdings.csv"),
+            "holdings": holdings,
         }
     if benchmark_series is not None:
         benchmark_label = (
