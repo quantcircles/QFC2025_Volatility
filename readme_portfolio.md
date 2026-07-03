@@ -536,8 +536,11 @@ All strategy backtests start with `100000` initial capital and apply `0.01%`
 transaction cost on exposure or weight turnover. Benchmark columns use the
 official NSE NIFTY 50 index close history when cached, with an equal-weight
 NIFTY constituent proxy fallback if index history is unavailable.
-Portfolio holdings are rebalanced on 31-calendar-day windows, with each block
-priced on the last available cached trading date inside the calendar window.
+Portfolio holdings for Fundamental, Technical, and Average Score strategies are
+rebalanced on 31-calendar-day windows. Optimized Average uses a 93-calendar-day
+optimization/rebalance window so weights are refreshed roughly every three
+months. Each block is priced on the last available cached trading date inside
+the calendar window.
 The buy-write backtest does not apply equity turnover transaction costs; its
 CSV focuses on option premium, option payoff, index return, and strategy return
 replication.

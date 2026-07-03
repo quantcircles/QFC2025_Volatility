@@ -3832,6 +3832,7 @@ def generate_strategy_backtests(
             "strategy": "optimized_average",
             "score_column": "average_score",
             "optimized": True,
+            "holding_calendar_days": 93,
             "candidate_count": top_n,
             "lookback_days": 126,
             "min_weight": 0.02,
@@ -3859,7 +3860,8 @@ def generate_strategy_backtests(
         symbol_metrics_df.to_csv(metrics_path, index=False)
         symbol_metrics_paths.append(metrics_path)
         dates = sorted(scored["score_date"].dropna().unique())
-        rebalance_windows = calendar_rebalance_windows(dates, holding_calendar_days)
+        strategy_holding_calendar_days = int(setting.get("holding_calendar_days", holding_calendar_days))
+        rebalance_windows = calendar_rebalance_windows(dates, strategy_holding_calendar_days)
         previous_weights: dict[str, float] = {}
         equity = initial_capital
         rows = []
@@ -3918,7 +3920,7 @@ def generate_strategy_backtests(
                 {
                     "start_date": pd.Timestamp(start_dt).strftime("%Y-%m-%d"),
                     "end_date": pd.Timestamp(end_dt).strftime("%Y-%m-%d"),
-                    "holding_calendar_days": holding_calendar_days,
+                    "holding_calendar_days": strategy_holding_calendar_days,
                     "holdings": snap.sort_values("weight", ascending=False)[["symbol", "score", "weight"]].to_dict("records"),
                 }
             )
@@ -4125,6 +4127,7 @@ def holdings_blocks_from_csv(path: Path) -> list[dict]:
                 "startDate": str(group["start_date"].iloc[0]),
                 "endDate": str(group["end_date"].iloc[0]),
                 "isCurrent": int(block_number) == max_block,
+                "holdingCalendarDays": json_clean(group["holding_calendar_days"].iloc[0]),
                 "portfolioValue": json_clean(group["portfolio_value_at_rebalance"].iloc[0]),
                 "holdings": [
                     {
