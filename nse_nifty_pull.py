@@ -3781,11 +3781,39 @@ def generate_strategy_backtests(
     holdings_paths: list[Path] = []
     symbol_metrics_paths: list[Path] = []
 
-    for strategy, score_column in [
-        ("fundamental", "fundamental_score"),
-        ("technical", "technical_score"),
-        ("average", "average_score"),
-    ]:
+    strategy_settings = [
+        {
+            "strategy": "fundamental",
+            "score_column": "fundamental_score",
+            "optimized": False,
+        },
+        {
+            "strategy": "technical",
+            "score_column": "technical_score",
+            "optimized": False,
+        },
+        {
+            "strategy": "average",
+            "score_column": "average_score",
+            "optimized": False,
+        },
+        {
+            "strategy": "optimized_average",
+            "score_column": "average_score",
+            "optimized": True,
+            "candidate_count": top_n,
+            "lookback_days": 126,
+            "min_weight": 0.03,
+            "max_weight": 0.20,
+            "risk_aversion": 1.00,
+        },
+    ]
+
+    returns_matrix = data.pivot_table(index="score_date", columns="symbol", values="symbol_return", aggfunc="last").sort_index()
+
+    for setting in strategy_settings:
+        strategy = str(setting["strategy"])
+        score_column = str(setting["score_column"])
         scored = data.copy()
         scored["score_exposure"] = scored[score_column].clip(lower=0, upper=100) / 100
         scored["weighted_return"] = scored["symbol_return"] * scored["score_exposure"]
@@ -3808,11 +3836,50 @@ def generate_strategy_backtests(
         for start_dt, end_dt in rebalance_windows:
             snap = scored[scored["score_date"].eq(start_dt)].copy()
             snap["score"] = snap[score_column].clip(lower=0)
-            snap = snap.dropna(subset=["score", "close"]).sort_values(["score", "symbol"], ascending=[False, True]).head(top_n)
+            snap = snap.dropna(subset=["score", "close"]).sort_values(["score", "symbol"], ascending=[False, True])
+            if bool(setting.get("optimized")):
+                candidate_count = int(setting.get("candidate_count", max(top_n * 2, top_n)))
+                lookback_days = int(setting.get("lookback_days", 126))
+                candidates = snap.head(candidate_count).copy()
+                history = returns_matrix.loc[returns_matrix.index < pd.Timestamp(start_dt)].tail(lookback_days)
+                available_symbols = [symbol for symbol in candidates["symbol"].astype(str) if symbol in history.columns]
+                if available_symbols and len(history) >= 20:
+                    hist = history[available_symbols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    trailing_return = (1 + hist).prod() - 1
+                    trailing_vol = hist.std(ddof=1) * np.sqrt(252)
+                    candidate_scores = candidates.set_index("symbol")["score"].reindex(available_symbols)
+                    composite = (
+                        0.45 * candidate_scores.rank(pct=True)
+                        + 0.35 * trailing_return.rank(pct=True)
+                        + 0.20 * (-trailing_vol).rank(pct=True)
+                    ).sort_values(ascending=False)
+                    chosen_symbols = composite.head(top_n).index.tolist()
+                    snap = candidates[candidates["symbol"].isin(chosen_symbols)].copy()
+                    snap["selection_rank"] = snap["symbol"].map({symbol: rank for rank, symbol in enumerate(chosen_symbols)})
+                    snap = snap.sort_values("selection_rank")
+                else:
+                    snap = candidates.head(top_n)
+            else:
+                snap = snap.head(top_n)
             if snap.empty:
                 continue
-            total_score = snap["score"].sum()
-            snap["weight"] = snap["score"] / total_score if total_score else 1 / len(snap)
+            snap = snap.copy()
+            if bool(setting.get("optimized")):
+                history = returns_matrix.loc[returns_matrix.index < pd.Timestamp(start_dt)].tail(int(setting.get("lookback_days", 126)))
+                symbols_for_weights = snap["symbol"].astype(str).tolist()
+                hist_for_weights = history.reindex(columns=symbols_for_weights).fillna(0.0)
+                score_series = snap.set_index("symbol")["score"].astype(float)
+                weights = optimize_score_weights(
+                    hist_for_weights,
+                    score_series,
+                    min_weight=float(setting.get("min_weight", 0.03)),
+                    max_weight=float(setting.get("max_weight", 0.20)),
+                    risk_aversion=float(setting.get("risk_aversion", 1.00)),
+                )
+                snap["weight"] = pd.Series(weights, index=score_series.index).reindex(snap["symbol"]).to_numpy()
+            else:
+                total_score = snap["score"].sum()
+                snap["weight"] = snap["score"] / total_score if total_score else 1 / len(snap)
             current_weights = snap.set_index("symbol")["weight"].astype(float).to_dict()
             blocks.append(
                 {
@@ -4051,6 +4118,7 @@ def build_backtest_dashboard_data(output_dir: Path) -> dict:
         "fundamental": "Fundamental",
         "technical": "Technical",
         "average": "Average Score",
+        "optimized_average": "Optimized Average",
     }
     selected_path = backtest_dir / "selected_top10_score_weighted_symbol_metrics.csv"
     selected = pd.read_csv(selected_path) if selected_path.exists() else pd.DataFrame()

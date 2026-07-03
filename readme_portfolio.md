@@ -343,6 +343,11 @@ When `--backtests` is used, generated files include:
   - Same fields for the Average Score strategy, where strategy score is
     `(fundamental_score + technical_score) / 2`.
 
+- `backtests/optimized_average_top10_score_weighted_backtest.csv`
+  - Same fields for the Optimized Average strategy. At every rebalance date it
+    selects the 10 highest Average Score names, then optimizes weights using
+    trailing returns, covariance risk, score alpha, and concentration penalties.
+
 - `backtests/*_top10_score_weighted_holdings.csv`
   - Rebalance holdings for each strategy, including score, weight, integer
     previous quantity, integer target quantity, integer quantity change, entry
