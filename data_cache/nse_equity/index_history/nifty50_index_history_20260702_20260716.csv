@@ -1,0 +1,2 @@
+trade_date,index_name,open,high,low,close,points_change,change_pct,volume,turnover_rs_cr,pe,pb,div_yield,source
+2026-07-16,NIFTY 50,24142.1,24186.5,24050,24072.75,-5.75,-0.02,264271962,24244.17,20.73,3.1,1.24,nse_index_close_archive
